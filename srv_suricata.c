@@ -32,13 +32,13 @@
 #include <pthread.h>
 
 /* ── c-icap ──────────────────────────────────────────────────────────────── */
-#include <c_icap/c-icap.h>
-#include <c_icap/service.h>
-#include <c_icap/header.h>
-#include <c_icap/body.h>
-#include <c_icap/simple_api.h>
-#include <c_icap/debug.h>
-#include <c_icap/cfg_param.h>
+#include "c-icap.h"  /* CI_DECLARE_FUNC, ci_request_t, … */
+#include "service.h"
+#include "header.h"
+#include "body.h"
+#include "simple_api.h"
+#include "debug.h"
+#include "cfg_param.h"
 
 /* ── libsuricata ─────────────────────────────────────────────────────────── */
 /*
@@ -47,15 +47,22 @@
  * your installation places them differently.
  */
 #include <suricata/suricata.h>       /* SuricataPreInit / SuricataInit / … */
-#include <suricata/conf.h>           /* ConfSet / ConfGet                  */
+#include <suricata/detect.h>       /* SCDetectEngineRegisterRateFilterCallback */
+#include <suricata/conf.h>           /* SCConfSet / SCConfGet                  */
 #include <suricata/runmodes.h>       /* SCRunmodeSet, RUNMODE_LIB, …       */
 #include <suricata/tm-threads.h>     /* TM_ECODE_OK, SCFinalizeRunMode     */
-#include <suricata/source-lib.h>     /* SCRunModeLibCreateThreadVars       */
+// #include <suricata/source-lib.h>     /* SCRunModeLibCreateThreadVars       */
 #include <suricata/util-debug.h>     /* SCLogNotice / ci_debug_printf      */
 #include <suricata/packet.h>         /* Packet, PacketGetFromQueueOrAlloc  */
 #include <suricata/decode.h>         /* PKT_SRC_WIRE, PacketSetData        */
 #include <suricata/util-time.h>      /* SCTIME_FROM_TIMEVAL                */
-#include <suricata/live.h>           /* LiveRegisterDevice / LiveGetDevice */
+// #include <suricata/live.h>           /* LiveRegisterDevice / LiveGetDevice */
+#include <suricata/runmode-lib.h>
+#include <suricata/action-globals.h>
+
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Module-wide globals
@@ -71,10 +78,10 @@
  * Hard-coded Suricata rule loaded during module init.
  * Fires on "evil" appearing anywhere in TCP payload — trivial but testable.
  */
-static const char *HARDCODED_RULE =
-    "alert tcp any any -> any any "
-    "(msg:\"ICAP-SURICATA PoC match — keyword evil found\"; "
-    "content:\"evil\"; nocase; sid:9000001; rev:1;)";
+// static const char *HARDCODED_RULE =
+//     "alert tcp any any -> any any "
+//     "(msg:\"ICAP-SURICATA PoC match — keyword evil found\"; "
+//     "content:\"evil\"; nocase; sid:9000001; rev:1;)";
 
 /*
  * Suricata worker thread bookkeeping (library-mode pattern from custom/main.c).
@@ -82,6 +89,7 @@ static const char *HARDCODED_RULE =
 static ThreadVars *g_worker_tv  = NULL;
 static pthread_t   g_worker_tid = 0;
 static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
+static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
 /* ── Suricata library worker thread ──────────────────────────────────────── */
 
@@ -117,14 +125,51 @@ static void *SuricataWorkerThread(void *arg)
 {
     (void)arg;
 
+    ci_debug_printf(1, "srv_suricata: SuricataWorkerThread ENTER\n");
+
     if (SCRunModeLibSpawnWorker(g_worker_tv) != 0) {
-        ci_debug_printf(1, "srv_suricata: SCRunModeLibSpawnWorker failed\n");
+        ci_debug_printf(1, "srv_suricata: SuricataWorkerThread SCRunModeLibSpawnWorker failed\n");
+        pthread_exit((void *)(intptr_t)EXIT_FAILURE);
     }
 
-    pthread_exit(NULL);
+    ci_debug_printf(5, "srv_suricata: SuricataWorkerThread SuricataMainLoop()\n");
+    SuricataMainLoop();
+
+    /* Cleanup.
+     *
+     * Note that there is some thread synchronization between this
+     * function and SuricataShutdown such that they must be run
+     * concurrently at this time before either will exit. */
+    if (g_worker_tv != NULL) {
+        ci_debug_printf(5, "srv_suricata: SuricataWorkerThread SCTmThreadsSlotPacketLoopFinish()\n");
+        SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
+    }
+
+    ci_debug_printf(1, "srv_suricata: SuricataWorkerThread exiting\n");
+    pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
 }
 
 /* ── Packet injection helper ─────────────────────────────────────────────── */
+static void ReleasePacket(Packet *p)
+{
+    ci_debug_printf(1, "srv_suricata: ReleasePacket called\n");
+    if (PacketCheckAction(p, ACTION_DROP)) {
+        SCLogNotice("Dropping packet!");
+    }
+
+    /* As we overode the default release function, we must release or
+     * free the packet. */
+    PacketFreeOrRelease(p);
+}
+
+/*
+ * Minimal 40-byte raw Layer 3 / Layer 4 structure 
+ * packed to ensure precise network formatting alignment.
+ */
+struct __attribute__((__packed__)) fake_pkt_hdr {
+    struct iphdr ip;
+    struct tcphdr tcp;
+};
 
 /*
  * BuildAndInjectPacket — wrap raw bytes in a minimal Suricata Packet and push
@@ -134,8 +179,8 @@ static void *SuricataWorkerThread(void *arg)
  * Suricata's DETECT module will match content-based signatures against the
  * raw bytes regardless of the encapsulation we claim.
  *
- * @param data   Pointer to the body buffer.
- * @param len    Number of bytes to inspect.
+ * @param data    Pointer to the body buffer.
+ * @param len     Number of bytes to inspect.
  */
 static void BuildAndInjectPacket(const uint8_t *data, int len)
 {
@@ -159,26 +204,69 @@ static void BuildAndInjectPacket(const uint8_t *data, int len)
     SCPacketSetTime(p, ts);
 
     /*
-     * LINKTYPE_RAW (228 / DLT_RAW):  raw IP, no Ethernet header.
-     * We fabricate a minimal IPv4 + TCP header so decode works; however
-     * for a content-only alert the exact IP/TCP fields do not matter.
-     *
-     * NOTE: In a later iteration you may instead use LINKTYPE_RAW and build
-     * a proper minimal header, or use Suricata's stream-layer inject path.
-     * For this PoC we pass the payload as-is with DLT_RAW and let Suricata
-     * treat it as an unknown protocol — the content keyword still fires.
+     * LINKTYPE_RAW (228 / DLT_RAW): raw IP, no Ethernet header.
+     * Because we are feeding LINKTYPE_RAW, Suricata expects the packet 
+     * buffer data to immediately start with a valid IP header.
      */
     SCPacketSetDatalink(p, LINKTYPE_RAW /* 228 */);
 
-    LiveDevice *dev = LiveGetDevice("suri_icap0");
-    if (dev != NULL)
-        SCPacketSetLiveDevice(p, dev);
-
-    if (PacketSetData(p, data, len) == -1) {
-        ci_debug_printf(1, "srv_suricata: PacketSetData failed\n");
+    LiveDevice *dev = LiveGetDevice("lib0");
+    if (dev != NULL) {
+        ci_debug_printf(5, "srv_suricata: obtained LiveDevice for injection\n");
+    } else {
+        ci_debug_printf(1, "srv_suricata: LiveGetDevice failed\n");
         TmqhOutputPacketpool(g_worker_tv, p);
         return;
     }
+
+    SCPacketSetLiveDevice(p, dev);
+    SCPacketSetReleasePacket(p, ReleasePacket);
+
+    /* * Construct the combined buffer containing the synthetic IP/TCP headers 
+     * followed immediately by the payload data chunks.
+     */
+    size_t header_len = sizeof(struct fake_pkt_hdr);
+    size_t total_len = header_len + len;
+    uint8_t *pkt_buf = malloc(total_len);
+    if (pkt_buf == NULL) {
+        ci_debug_printf(1, "srv_suricata: allocation for pkt_buf failed\n");
+        TmqhOutputPacketpool(g_worker_tv, p);
+        return;
+    }
+
+    struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt_buf;
+    memset(hdr, 0, header_len);
+
+    /* --- Populate Minimal IPv4 Header --- */
+    hdr->ip.version = 4;
+    hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
+    hdr->ip.tot_len = htons(total_len);
+    hdr->ip.ttl = 64;
+    hdr->ip.protocol = IPPROTO_TCP;         /* Identifies payload as TCP */
+    hdr->ip.saddr = htonl(0x7F000001);      /* Source: 127.0.0.1 */
+    hdr->ip.daddr = htonl(0x7F000001);      /* Destination: 127.0.0.1 */
+
+    /* --- Populate Minimal TCP Header --- */
+    hdr->tcp.source = htons(12345);         /* Fake ephemeral source port */
+    hdr->tcp.dest = htons(80);              /* Fake destination port (HTTP) */
+    hdr->tcp.doff = 5;                      /* 5 dwords = 20 bytes, no options */
+    hdr->tcp.ack = 1;                       /* Pretend this is an established data segment */
+
+    /* Append the raw ICAP body payload bytes right after the headers */
+    memcpy(pkt_buf + header_len, data, len);
+
+    /* Hand over the synthesized buffer to the Suricata Packet allocation */
+    if (PacketSetData(p, pkt_buf, total_len) == -1) {
+        ci_debug_printf(1, "srv_suricata: PacketSetData failed\n");
+        free(pkt_buf);
+        TmqhOutputPacketpool(g_worker_tv, p);
+        return;
+    }
+
+    /* * Suricata copies the contents internally when PacketSetData is called, 
+     * meaning we must clean up our temporary layout allocation right here.
+     */
+    free(pkt_buf);
 
     /*
      * Push packet into the detection pipeline.
@@ -190,6 +278,13 @@ static void BuildAndInjectPacket(const uint8_t *data, int len)
         TmqhOutputPacketpool(g_worker_tv, p);
     }
 
+    /* --- QUERY VERDICT HERE (Immediately after processing completes) --- */
+    if (p->action & ACTION_DROP) {
+        ci_debug_printf(1, "srv_suricata: Action verdict MATCHED a blocking signature, drop reason: %s\n",
+            PacketDropReasonToString(p->drop_reason));
+    }
+
+    LiveDevicePktsIncr(dev);
     /* Suricata owns the packet from here; do not free it ourselves. */
 }
 
@@ -243,6 +338,14 @@ static ci_service_module_t suricata_service = {
 /* Macro that registers the service with c-icap's module loader. */
 _CI_DECLARE_SERVICE(suricata_service);
 
+static uint8_t RateFilterCallback(const Packet *p, const uint32_t sid, const uint32_t gid,
+        const uint32_t rev, uint8_t original_action, uint8_t new_action, void *arg)
+{
+    /* Don't change the action. */
+    return new_action;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * suri_init_service — called once when the module is loaded
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -267,8 +370,12 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
      * directly via the Conf API so this module has zero external dependencies.
      */
 
+    // if (SCLoadYamlConfig() != TM_ECODE_OK) {
+    //     exit(EXIT_FAILURE);
+    // }
     /* Log to a file next to the c-icap log directory. */
-    ConfSet("default-log-dir", "/var/log/suricata-icap");
+    // SCConfSet("default-log-dir", "/var/log/suricata-icap");
+    SCConfSet("default-log-dir", ".");
 
     /* Offline / library mode — no live capture device required. */
     SCRunmodeSet(RUNMODE_LIB);
@@ -285,11 +392,11 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
      * Even in library mode the engine needs a LiveDevice for packets to be
      * associated with.  We create a virtual one.
      */
-    if (LiveRegisterDevice("suri_icap0") < 0) {
+    // if (LiveRegisterDevice("suri_icap0") < 0) {
+    if (LiveRegisterDevice("lib0") < 0) {
         ci_debug_printf(1, "srv_suricata: LiveRegisterDevice failed\n");
         return CI_ERROR;
     }
-
     /* ── 4. Register our custom runmode with its setup callback ─────────── */
 
     RunModeRegisterNewRunMode(
@@ -301,30 +408,63 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
     );
 
     /* Tell Suricata to use our custom runmode. */
-    if (!ConfSet("runmode", "icap")) {
-        ci_debug_printf(1, "srv_suricata: ConfSet runmode failed\n");
+    if (!SCConfSet("runmode", "icap")) {
+        ci_debug_printf(1, "srv_suricata: SCConfSet runmode failed\n");
         return CI_ERROR;
     }
+
+    if (SCLoadYamlConfig() != TM_ECODE_OK) {
+        exit(EXIT_FAILURE);
+    }
+
+    // SCEnableDefaultSignalHandlers();
 
     /* ── 5. Load the hard-coded detection rule ──────────────────────────── */
 
     /*
      * Suricata expects rules either via a file path or inline.
-     * ConfSet("rule-files.0", ...) points to a file; alternatively we can
+     * SCConfSet("rule-files.0", ...) points to a file; alternatively we can
      * write the rule to a temp file.  For the PoC we do the latter so the
      * caller needs no external rule files.
      */
     {
+        // if (SCLoadYamlConfig() != TM_ECODE_OK) {
+        //     exit(EXIT_FAILURE);
+        // }
         char rule_path[] = "/tmp/srv_suricata_poc.rules";
-        FILE *fp = fopen(rule_path, "w");
-        if (fp == NULL) {
-            ci_debug_printf(1, "srv_suricata: cannot write temp rule file\n");
-            return CI_ERROR;
-        }
-        fprintf(fp, "%s\n", HARDCODED_RULE);
-        fclose(fp);
+        // FILE *fp = fopen(rule_path, "w");
+        // if (fp == NULL) {
+        //     ci_debug_printf(1, "srv_suricata: cannot write temp rule file\n");
+        //     return CI_ERROR;
+        // }
+        // fprintf(fp, "%s\n", HARDCODED_RULE);
+        // fclose(fp);
 
-        ConfSet("rule-files.0", rule_path);
+        // SCConfSet("rule-files.0", rule_path);
+        // ci_debug_printf(5, "srv_suricata: loaded rule from %s\n", rule_path);
+
+        // char rule_path[] = "/usr/local/var/lib/suricata/rules/";
+        // SCConfSet("rule-files.0", "suricata.rules");
+        // SCConfSet("sig-file", "/tmp/srv_suricata_poc.rules");
+        // SCConfSetFromString("reference-config-file=/usr/local/etc/suricata/suricata.yaml", 1);
+
+        // SCConfSetFromString("classification-file:/usr/local/etc/suricata/classification.config", 1);
+        // SCConfSetFromString("reference-config-file:/usr/local/etc/suricata/reference.config", 1);
+        // SCConfSetFromString("default-rule-path:/usr/local/var/lib/suricata/rules/", 1);
+
+        SCConfSetFromString("default-log-dir=.", 1);
+        // SCConfSetFromString("rule-file.0=/usr/local/var/lib/suricata/rules/suricata.rules", 1);
+        // SCConfSetFromString("rule-file.1=/tmp/srv_suricata_poc.rules", 1);
+        // SCConfSetFromString("rule-files=.Include /tmp/srv_suricata_poc.rules", 0);
+        // SCConfSetFromString("rule-files=[/tmp/srv_suricata_poc.rules, /usr/local/var/lib/suricata/rules/suricata.rules]", 1);
+        // SCConfSetFromString("rule-files=/tmp/srv_suricata_poc.rules", 1);
+        
+        SCConfSetFromString("default-rule-path=/tmp", 1);
+        // SCConfSet("rule-file", "srv_suricata_poc.rules");
+        // SCConfSetFromString("rule-files=\n   - srv_suricata_poc.rules\n", 1);
+        // SCConfSetFromString("rule-files:\n", 0);
+        // SCConfSetFromString("   - srv_suricata_poc.rules\n", 1);
+        // SCConfSetFromString("S=/tmp/srv_suricata_poc.rules", 1);
         ci_debug_printf(5, "srv_suricata: loaded rule from %s\n", rule_path);
     }
 
@@ -332,7 +472,11 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
 
     SuricataInit();
 
+    SCDetectEngineRegisterRateFilterCallback(RateFilterCallback, NULL);
+
     /* ── 7. Spawn the worker thread ─────────────────────────────────────── */
+
+    /* Spawn our worker threads. */
 
     if (pthread_create(&g_worker_tid, NULL, SuricataWorkerThread, NULL) != 0) {
         ci_debug_printf(1, "srv_suricata: pthread_create for worker failed\n");
@@ -342,6 +486,7 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
     /* ── 8. Post-init (seals threads, starts packet queues, etc.) ────────── */
 
     SuricataPostInit();
+    g_parent_pid = getpid(); /* Record the exact PID that initialized the engine */
     g_suri_ready = 1;
 
     ci_debug_printf(5, "srv_suricata: Suricata engine ready\n");
@@ -349,10 +494,10 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
     /* ── 9. Advertise ICAP capabilities ─────────────────────────────────── */
 
     /* Request up to 4 KiB of preview data. */
-    ci_service_set_preview(srv_xdata, 4096);
+    // ci_service_set_preview(srv_xdata, 4096);
 
     /* We support 204 (no modification) responses. */
-    ci_service_enable_204(srv_xdata);
+    // ci_service_enable_204(srv_xdata);
 
     /* Ask clients to send preview for all content types. */
     ci_service_set_transfer_preview(srv_xdata, "*");
@@ -366,24 +511,46 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
 
 void suri_close_service(void)
 {
-    ci_debug_printf(5, "srv_suricata: shutting down Suricata engine...\n");
+    pid_t current_pid = getpid();
+    ci_debug_printf(5, "srv_suricata: shutting down Suricata engine... g_suri_ready=%d, g_parent_pid=%d, current_pid=%d\n", g_suri_ready, g_parent_pid, current_pid);
 
-    if (g_suri_ready) {
-        g_suri_ready = 0;
+    if (!g_suri_ready) {
+        return;
+    }
+    g_suri_ready = 0;
+
+    /* * CRITICAL CHECK: Only tear down threads and force exit if we are running 
+     * inside the specific child process context that initialized them.
+     */
+    if (current_pid == g_parent_pid) {
+        ci_debug_printf(5, "srv_suricata: suri_close_service Start Suricata shutdown in parent process, current_pid=%d\n", current_pid);
+
+        ci_debug_printf(5, "srv_suricata: suri_close_service EngineStop()\n");
         EngineStop();
+
+        ci_debug_printf(5, "srv_suricata: suri_close_service SuricataShutdown()\n");
+        SuricataShutdown();
 
         /*
          * SuricataShutdown and the worker's SCTmThreadsSlotPacketLoopFinish
          * must run concurrently (see custom/main.c notes).  The pthread_join
          * here ensures the worker has finished before we return.
          */
+        ci_debug_printf(5, "srv_suricata: suri_close_service pthread_join()\n");
         pthread_join(g_worker_tid, NULL);
 
-        SuricataShutdown();
+        ci_debug_printf(5, "srv_suricata: GlobalsDestroy()\n");
         GlobalsDestroy();
-    }
 
-    ci_debug_printf(5, "srv_suricata: shutdown complete\n");
+        ci_debug_printf(5, "srv_suricata: suri_close_service shutdown complete, current_pid=%d\n", current_pid);
+    }
+    else {
+        /* * We are in the master parent process. The child has already exited, 
+         * so we just clear our local flag status and return normally to let 
+         * c-icap finalize its own master process shutdown sequence.
+         */
+        ci_debug_printf(5, "srv_suricata: Bypass Suricata shutdown in child process, current_pid=%d\n", current_pid);
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -553,9 +720,13 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof,
     struct suricata_req_data *d = ci_service_data(req);
     int ret = CI_OK;
 
+    ci_debug_printf(5, "srv_suricata: suri_io recv %d bytes, send %d bytes, iseof = %d\n", *rlen, *wlen, iseof);
+    ci_debug_printf(5, "srv_suricata: suri_io rbuf = %p, wbuf = %p\n", rbuf, wbuf);
+    ci_req_unlock_data(req);
+
     /* ── Receive side: accumulate data arriving from ICAP client ─────── */
     if (rbuf && rlen && *rlen > 0) {
-        ci_debug_printf(10, "srv_suricata: suri_io recv %d bytes\n", *rlen);
+        ci_debug_printf(5, "srv_suricata: suri_io recv %d bytes\n", *rlen);
 
         /*
          * ── Suricata injection point #3: streaming chunk ────────────────
@@ -574,24 +745,66 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof,
 
     /* ── Send side: pass data through unmodified ─────────────────────── */
     if (wbuf && wlen) {
+    // if (wbuf) {
         if (rbuf && rlen && *rlen > 0) {
             /*
              * Echo the just-read bytes back so the HTTP response continues
              * flowing to the client without modification.
              */
             int copy_len = (*rlen < *wlen) ? *rlen : *wlen;
+            ci_debug_printf(5, "srv_suricata: suri_io send %d bytes\n", copy_len);
             memcpy(wbuf, rbuf, copy_len);
             *wlen = copy_len;
         } else {
             /* Nothing new to send yet. */
+            ci_debug_printf(5, "srv_suricata: Nothing new to send yet\n");
             *wlen = 0;
+            // int copy_len = (d->body_len < *wlen) ? d->body_len : *wlen;
+            // // int copy_len = (*wlen == 0) ? d->body_len : *wlen;
+            // // int copy_len = d->body_len;
+            // if (copy_len > 0) {
+            //     ci_debug_printf(7, "srv_suricata: responding %d bytes to SSLproxy\n", copy_len);
+            //     memcpy(wbuf, d->body_buf, copy_len);
+            //     *wlen = copy_len;
+            // }
         }
+
+        // if (*wlen == 0) {
+        //     /* No pending data to send, but we still need to signal EOF if we've reached the end. */
+        //     if (iseof) {
+        //         ci_debug_printf(7, "srv_suricata: suri_io EOF reached with no pending data, signaling EOF\n");
+        //         *wlen = CI_EOF;
+        //     } else {
+        //         /* No data to send and not EOF, just wait for the next call. */
+        //         *wlen = 0;
+        //     }
+        // }
+        // else if (d->body_len > 0) {
+        //     // int copy_len = (d->body_len < *wlen) ? d->body_len : *wlen;
+        //     // int copy_len = (*wlen == 0) ? d->body_len : *wlen;
+        //     int copy_len = d->body_len;
+        //     ci_debug_printf(7, "srv_suricata: responding %d bytes to SSLproxy\n", copy_len);
+        //     memcpy(wbuf, d->body_buf, copy_len);
+        //     *wlen = copy_len;
+        // }
+        // if (*wlen == 0) {
+        //     int copy_len = d->body_len;
+        //     ci_debug_printf(7, "srv_suricata: responding %d bytes to SSLproxy\n", copy_len);
+        //     memcpy(wbuf, d->body_buf, copy_len);
+        //     *wlen = copy_len;
+        // }
 
         /* Signal EOF to c-icap once we know there is no more data. */
         if (d->eof || iseof) {
+            ci_debug_printf(5, "srv_suricata: Set EOF\n");
             *wlen = CI_EOF;
+            // *wlen = CI_NEEDS_MORE;
         }
     }
+    // if (*rlen == 0 && *wlen == 0 && iseof) {
+    //     ci_debug_printf(5, "srv_suricata: Set EOF\n");
+    //     *wlen = CI_EOF;
+    // }
 
     return ret;
 }
