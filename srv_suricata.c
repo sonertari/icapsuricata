@@ -320,16 +320,21 @@ struct suricata_req_data {
  * Forward declarations — c-icap handler prototypes
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-int  suri_init_service(ci_service_xdata_t *srv_xdata,
-                       struct ci_server_conf *server_conf);
+enum suri_mode {mode_disallow204, mode_allow204};
+static int MODE = mode_allow204;
+
+static int  suri_cfg_mode(const char *directive, const char **argv, void *setdata);
+static struct ci_conf_entry suri_conf_variables[] = {
+    {"Mode", NULL, suri_cfg_mode, NULL}
+};
+
+int  suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf);
 void suri_close_service(void);
 void *suri_init_request_data(ci_request_t *req);
 void suri_release_request_data(void *data);
-int  suri_check_preview_handler(char *preview_data, int preview_data_len,
-                                ci_request_t *req);
+int  suri_check_preview_handler(char *preview_data, int preview_data_len, ci_request_t *req);
 int  suri_end_of_data_handler(ci_request_t *req);
-int  suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof,
-             ci_request_t *req);
+int  suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * ci_service_module_t registration
@@ -347,7 +352,7 @@ static ci_service_module_t suricata_service = {
     suri_check_preview_handler,         /* mod_check_preview_handler */
     suri_end_of_data_handler,           /* mod_end_of_data_handler   */
     suri_io,                            /* mod_service_io            */
-    NULL,                               /* conf_variables            */
+    suri_conf_variables,                /* conf_variables            */
     NULL                                /* xdata                     */
 };
 
@@ -701,4 +706,15 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
     }
 
     return ret;
+}
+
+int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
+{
+    if (strcasecmp(argv[0], "disallow204") == 0)
+        MODE= mode_disallow204;
+    else {
+        ci_debug_printf(1, "Unknown value '%s' for configuration parameter '%s'\n", argv[0], directive);
+        return 0;
+    }
+    return 1;
 }
