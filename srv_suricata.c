@@ -1,3 +1,25 @@
+/*-
+ * Suricata IDS ICAP inspection service module
+ *
+ * Copyright (c) 2026, Soner Tari <sonertari@gmail.com>.
+ * All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+ * MA  02110-1301  USA.
+ */
+
 /*
  * srv_suricata.c — Minimalist c-icap service module using libsuricata
  *
@@ -47,7 +69,7 @@
  * your installation places them differently.
  */
 #include <suricata/suricata.h>       /* SuricataPreInit / SuricataInit / … */
-#include <suricata/detect.h>       /* SCDetectEngineRegisterRateFilterCallback */
+#include <suricata/detect.h>         /* SCDetectEngineRegisterRateFilterCallback */
 #include <suricata/conf.h>           /* SCConfSet / SCConfGet                  */
 #include <suricata/runmodes.h>       /* SCRunmodeSet, RUNMODE_LIB, …       */
 #include <suricata/tm-threads.h>     /* TM_ECODE_OK, SCFinalizeRunMode     */
@@ -72,15 +94,6 @@
  * Keep small for the PoC; bump later or switch to streaming chunks.
  */
 #define SRV_SURICATA_MAX_BODY (256 * 1024)  /* 256 KiB */
-
-/*
- * Hard-coded Suricata rule loaded during module init.
- * Fires on "evil" appearing anywhere in TCP payload — trivial but testable.
- */
-// static const char *HARDCODED_RULE =
-//     "alert tcp any any -> any any "
-//     "(msg:\"ICAP-SURICATA PoC match — keyword evil found\"; "
-//     "content:\"evil\"; nocase; sid:9000001; rev:1;)";
 
 /*
  * Suricata worker thread bookkeeping (library-mode pattern from custom/main.c).
@@ -206,12 +219,11 @@ static void BuildAndInjectPacket(const uint8_t *data, int len)
     SCPacketSetTime(p, ts);
 
     /*
-     * LINKTYPE_RAW (228 / DLT_RAW): raw IP, no Ethernet header.
+     * LINKTYPE_RAW (DLT_RAW): raw IP, no Ethernet header.
      * Because we are feeding LINKTYPE_RAW, Suricata expects the packet 
      * buffer data to immediately start with a valid IP header.
      */
-    // TODO: LINKTYPE_RAW is DLT_RAW, which is 12 actually
-    SCPacketSetDatalink(p, LINKTYPE_RAW /* 228 */);
+    SCPacketSetDatalink(p, LINKTYPE_RAW);
 
     LiveDevice *dev = LiveGetDevice("suri_icap0");
     if (dev != NULL) {
@@ -367,17 +379,6 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
      */
     SuricataPreInit("srv_suricata");
 
-    /* ── 2. Configure the engine programmatically ───────────────────────── */
-
-    /*
-     * We do NOT load a yaml config file.  All mandatory settings are injected
-     * directly via the Conf API so this module has zero external dependencies.
-     */
-
-    /* Log to a file next to the c-icap log directory. */
-    // SCConfSet("default-log-dir", "/var/log/suricata-icap");
-    // SCConfSet("default-log-dir", ".");
-
     /* Offline / library mode — no live capture device required. */
     SCRunmodeSet(RUNMODE_LIB);
 
@@ -415,55 +416,10 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
 
     SCEnableDefaultSignalHandlers();
 
-    /* ── 5. Load the hard-coded detection rule ──────────────────────────── */
+    /* ── 5. Load the config file ──────────────────────────── */
 
-    /*
-     * Suricata expects rules either via a file path or inline.
-     * SCConfSet("rule-files.0", ...) points to a file; alternatively we can
-     * write the rule to a temp file.  For the PoC we do the latter so the
-     * caller needs no external rule files.
-     */
-    {
-        // TODO: Retry these rule configuration calls until we find one that works, until then we load from config file
-        if (SCLoadYamlConfig() != TM_ECODE_OK) {
-            exit(EXIT_FAILURE);
-        }
-
-        char rule_path[] = "/tmp/srv_suricata_poc.rules";
-        // FILE *fp = fopen(rule_path, "w");
-        // if (fp == NULL) {
-        //     ci_debug_printf(1, "srv_suricata: cannot write temp rule file\n");
-        //     return CI_ERROR;
-        // }
-        // fprintf(fp, "%s\n", HARDCODED_RULE);
-        // fclose(fp);
-
-        // SCConfSet("rule-files.0", rule_path);
-        // ci_debug_printf(5, "srv_suricata: loaded rule from %s\n", rule_path);
-
-        // char rule_path[] = "/usr/local/var/lib/suricata/rules/";
-        // SCConfSet("rule-files.0", "suricata.rules");
-        // SCConfSet("sig-file", "/tmp/srv_suricata_poc.rules");
-        // SCConfSetFromString("reference-config-file=/usr/local/etc/suricata/suricata.yaml", 1);
-
-        // SCConfSetFromString("classification-file:/usr/local/etc/suricata/classification.config", 1);
-        // SCConfSetFromString("reference-config-file:/usr/local/etc/suricata/reference.config", 1);
-        // SCConfSetFromString("default-rule-path:/usr/local/var/lib/suricata/rules/", 1);
-
-        SCConfSetFromString("default-log-dir=.", 1);
-        // SCConfSetFromString("rule-file.0=/usr/local/var/lib/suricata/rules/suricata.rules", 1);
-        // SCConfSetFromString("rule-file.1=/tmp/srv_suricata_poc.rules", 1);
-        // SCConfSetFromString("rule-files=.Include /tmp/srv_suricata_poc.rules", 0);
-        // SCConfSetFromString("rule-files=[/tmp/srv_suricata_poc.rules, /usr/local/var/lib/suricata/rules/suricata.rules]", 1);
-        // SCConfSetFromString("rule-files=/tmp/srv_suricata_poc.rules", 1);
-        
-        SCConfSetFromString("default-rule-path=/tmp", 1);
-        // SCConfSet("rule-file", "srv_suricata_poc.rules");
-        // SCConfSetFromString("rule-files=\n   - srv_suricata_poc.rules\n", 1);
-        // SCConfSetFromString("rule-files:\n", 0);
-        // SCConfSetFromString("   - srv_suricata_poc.rules\n", 1);
-        // SCConfSetFromString("S=/tmp/srv_suricata_poc.rules", 1);
-        ci_debug_printf(5, "srv_suricata: loaded rule from %s\n", rule_path);
+    if (SCLoadYamlConfig() != TM_ECODE_OK) {
+        exit(EXIT_FAILURE);
     }
 
     /* ── 6. Initialise the engine (calls SuricataRunModeSetup callback) ─── */
@@ -473,8 +429,6 @@ int suri_init_service(ci_service_xdata_t *srv_xdata,
     SCDetectEngineRegisterRateFilterCallback(RateFilterCallback, NULL);
 
     /* ── 7. Spawn the worker thread ─────────────────────────────────────── */
-
-    /* Spawn our worker threads. */
 
     if (pthread_create(&g_worker_tid, NULL, SuricataWorkerThread, NULL) != 0) {
         ci_debug_printf(1, "srv_suricata: suri_init_service: pthread_create for worker failed\n");
@@ -518,7 +472,7 @@ void suri_close_service(void)
     g_suri_ready = 0;
 
     /* * CRITICAL CHECK: Only tear down threads and force exit if we are running 
-     * inside the specific child process context that initialized them.
+     * inside the specific process context that initialized them.
      */
     if (current_pid == g_parent_pid) {
         ci_debug_printf(5, "srv_suricata: suri_close_service: Start Suricata shutdown in parent process, current_pid=%d\n", current_pid);
