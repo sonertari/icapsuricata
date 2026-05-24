@@ -158,7 +158,7 @@ struct __attribute__((__packed__)) fake_pkt_hdr {
 // We present the payload as a raw TCP segment on a fake loopback device.
 // Suricata's DETECT module will match content-based signatures against the
 // raw bytes regardless of the encapsulation we claim.
-static int BuildAndInjectPacket(const char *data, int len)
+static int BuildAndInjectPacket(const char *data, int len, ci_request_t *req)
 {
     if (!g_suri_ready || g_worker_tv == NULL) {
         ci_debug_printf(3, "srv_suricata: BuildAndInjectPacket: engine not ready, skipping packet injection\n");
@@ -207,23 +207,73 @@ static int BuildAndInjectPacket(const char *data, int len)
         return -1;
     }
 
+    // Populate IP Header from icap extended headers for network context
+    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
+    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
+    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
+    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
+    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
+
     struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt_buf;
     memset(hdr, 0, header_len);
 
-    // Populate Minimal IPv4 Header
     hdr->ip.version = 4;
     hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
     hdr->ip.tot_len = htons(total_len);
     hdr->ip.ttl = 64;
-    hdr->ip.protocol = IPPROTO_TCP;         /* Identifies payload as TCP */
-    hdr->ip.saddr = htonl(0x7F000001);      /* Source: 127.0.0.1 */
-    hdr->ip.daddr = htonl(0x7F000001);      /* Destination: 127.0.0.1 */
 
-    // Populate Minimal TCP Header
-    hdr->tcp.source = htons(12345);         /* Fake ephemeral source port */
-    hdr->tcp.dest = htons(80);              /* Fake destination port (HTTP) */
-    hdr->tcp.doff = 5;                      /* 5 dwords = 20 bytes, no options */
-    hdr->tcp.ack = 1;                       /* Pretend this is an established data segment */
+    const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
+
+    // Handle Protocol selection dynamically
+    if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
+        hdr->ip.protocol = IPPROTO_UDP;
+    } else {
+        hdr->ip.protocol = IPPROTO_TCP;     /* Default to TCP */
+    }
+
+    const char *src_ip_str = ci_icap_request_get_header(req, "X-Client-IP");
+
+    // Convert Source IP string to network byte order
+    if (src_ip_str && inet_pton(AF_INET, src_ip_str, &hdr->ip.saddr) != 1) {
+        ci_debug_printf(1, "srv_suricata: Invalid source IP string '%s', falling back\n", src_ip_str);
+        hdr->ip.saddr = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+    }
+
+    const char *dst_ip_str = ci_icap_request_get_header(req, "X-Server-IP");
+
+    // Convert Destination IP string to network byte order
+    if (dst_ip_str && inet_pton(AF_INET, dst_ip_str, &hdr->ip.daddr) != 1) {
+        ci_debug_printf(1, "srv_suricata: Invalid dest IP string '%s', falling back\n", dst_ip_str);
+        hdr->ip.daddr = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+    }
+
+    // Populate TCP/UDP Header Ports from extended headers for network context
+    // Note: The memory layout of tcphdr and udphdr both place the 16-bit 
+    // source port at byte offset 0, and dest port at byte offset 2. 
+    // Writing to hdr->tcp works perfectly for layer-4 bucketing.
+    const char *src_port_str = ci_icap_request_get_header(req, "X-Client-Port");
+
+    if (src_port_str) {
+        int s_port = atoi(src_port_str);
+        hdr->tcp.source = htons((uint16_t)s_port);
+    } else {
+        hdr->tcp.source = htons(12345);     /* Fallback */
+    }
+
+    const char *dst_port_str = ci_icap_request_get_header(req, "X-Server-Port");
+
+    if (dst_port_str) {
+        int d_port = atoi(dst_port_str);
+        hdr->tcp.dest = htons((uint16_t)d_port);
+    } else {
+        hdr->tcp.dest = htons(80);          /* Fallback */
+    }
+
+    // If it is TCP, set the data offset and flags
+    if (hdr->ip.protocol == IPPROTO_TCP) {
+        hdr->tcp.doff = 5;                  /* 5 dwords = 20 bytes, no options */
+        hdr->tcp.ack = 1;                   /* Pretend an established segment */
+    }
 
     // Append the raw ICAP body payload bytes right after the headers
     memcpy(pkt_buf + header_len, data, len);
@@ -519,7 +569,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     }
 
     ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Injecting %d bytes into Suricata\n", preview_data_len);
-    int rv = BuildAndInjectPacket(preview_data, preview_data_len);
+    int rv = BuildAndInjectPacket(preview_data, preview_data_len, req);
 
     if (rv == 1) {
         ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: BuildAndInjectPacket returned block\n");
@@ -570,7 +620,7 @@ int suri_end_of_data_handler(ci_request_t *req)
     // Only inject if we haven't already done so in the preview handler
     if (!data->eof && data->body_len > 0) {
         ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", data->body_len);
-        int rv = BuildAndInjectPacket(data->body_buf, data->body_len);
+        int rv = BuildAndInjectPacket(data->body_buf, data->body_len, req);
         if (rv == 1) {
             ci_debug_printf(5, "srv_suricata: suri_end_of_data: BuildAndInjectPacket returned block\n");
             ci_icap_add_xheader(req, "X-Response-Info: blocked");
