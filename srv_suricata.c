@@ -50,13 +50,13 @@
 #include <pthread.h>
 
 // Adjust the include path in the Makefile if your installation places these headers differently
-#include "c-icap.h"
-#include "service.h"
-#include "header.h"
-#include "body.h"
-#include "simple_api.h"
-#include "debug.h"
-#include "cfg_param.h"
+#include <c-icap/c-icap.h>
+#include <c-icap/service.h>
+#include <c-icap/header.h>
+#include <c-icap/body.h>
+#include <c-icap/simple_api.h>
+#include <c-icap/debug.h>
+#include <c-icap/cfg_param.h>
 
 // These headers are installed via `make install-headers`
 #include <suricata/suricata.h>
@@ -291,7 +291,7 @@ int  suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request
 
 static ci_service_module_t suricata_service = {
     "suricata",                         /* mod_name                  */
-    "Suricata IDS ICAP inspection PoC", /* mod_short_descr           */
+    "Suricata IDS ICAP inspection",     /* mod_short_descr           */
     ICAP_RESPMOD | ICAP_REQMOD,         /* mod_type                  */
     suri_init_service,                  /* mod_init_service          */
     NULL,                               /* post_init_service         */

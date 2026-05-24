@@ -1,8 +1,8 @@
-# Makefile — srv_suricata.so  (c-icap + libsuricata PoC)
+# Makefile — srv_suricata.so  (c-icap + libsuricata)
 #
 # Prerequisites
 # ─────────────
-#   1. c-icap development headers installed (e.g. libc-icap-dev or built from
+#   1. c-icap development headers installed (e.g. libicapapi-dev or built from
 #      source).  Adjust CICAP_PREFIX if installed in a non-standard location.
 #
 #   2. Suricata built and installed as a library:
@@ -23,18 +23,20 @@ INSTALL ?= install
 
 # ── c-icap settings ──────────────────────────────────────────────────────────
 # Use c-icap's pkg-config if available; otherwise fall back to manual paths.
-#CICAP_PREFIX   ?= /usr
-CICAP_PREFIX   ?= ../../../SSLproxy/docs/ICAP/c-icap-server
+CICAP_PREFIX   ?= /usr
 
+# Capture any hidden compiler macros required by the libraries, but should work without it too
 CICAP_CFLAGS   := $(shell pkg-config --cflags c_icap 2>/dev/null || \
-                   echo -I$(CICAP_PREFIX)/include)
-#                   echo -I$(CICAP_PREFIX)/include/c_icap)
-CICAP_LDFLAGS  := $(shell pkg-config --libs   c_icap 2>/dev/null || \
-                   echo -L$(CICAP_PREFIX)/.libs)
-#                   echo -L$(CICAP_PREFIX)/lib -lc_icap)
+                   echo -I$(CICAP_PREFIX)/include/c-icap)
+
+# srv_suricata.so runs inside c-icap, so we don't need to link against the full c-icap library
+# CICAP_LDFLAGS  := $(shell pkg-config --libs   c_icap 2>/dev/null || \
+#                   echo -L$(CICAP_PREFIX)/lib/c-icap)
 
 # ── libsuricata settings ──────────────────────────────────────────────────────
-SURI_CFLAGS    := $(shell libsuricata-config --cflags)
+SURI_CFLAGS    := $(shell libsuricata-config --cflags 2>/dev/null)
+
+# Link explicitly against libsuricata
 SURI_LDFLAGS   := $(shell libsuricata-config --libs)
 
 # ── Compiler flags ───────────────────────────────────────────────────────────
@@ -64,7 +66,7 @@ clean:
 	rm -f $(TARGET)
 
 # Destination for `make install` — override on the command line if needed.
-MODULES_DIR ?= /usr/lib/c_icap
+MODULES_DIR ?= /usr/lib/c-icap
 
 install: $(TARGET)
 	$(INSTALL) -D -m 0755 $(TARGET) $(MODULES_DIR)/$(TARGET)
