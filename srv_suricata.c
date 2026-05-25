@@ -84,235 +84,6 @@ static pthread_t   g_worker_tid = 0;
 static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
 static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
-// The library runmode needs at least one ThreadVars created in a runmode-setup
-// callback before SuricataInit seals the threads.
-static int SuricataRunModeSetup(void)
-{
-    ci_debug_printf(1, "srv_suricata: SuricataRunModeSetup: ENTER\n");
-
-    // TimeModeSetOffline: we feed synthetic packets with fabricated timestamps,
-    // so we do not want the engine to complain about clock skew.
-    TimeModeSetOffline();
-
-    g_worker_tv = SCRunModeLibCreateThreadVars(1 /* worker_id */);
-    if (g_worker_tv == NULL) {
-        ci_debug_printf(1, "srv_suricata: SuricataRunModeSetup: SCRunModeLibCreateThreadVars failed\n");
-        return -1;
-    }
-    return 0;
-}
-
-// Worker thread body: keeps the Suricata slot loop alive so that packets we
-// inject via TmThreadsSlotProcessPkt() are actually processed.
-// Here we simply block inside SuricataMainLoop which returns only when the
-// engine is stopped.
-static void *SuricataWorkerThread(void *arg)
-{
-    (void)arg;
-
-    ci_debug_printf(1, "srv_suricata: SuricataWorkerThread: ENTER\n");
-
-    if (SCRunModeLibSpawnWorker(g_worker_tv) != 0) {
-        ci_debug_printf(1, "srv_suricata: SuricataWorkerThread: SCRunModeLibSpawnWorker failed\n");
-        pthread_exit((void *)(intptr_t)EXIT_FAILURE);
-    }
-
-    ci_debug_printf(5, "srv_suricata: SuricataWorkerThread: SuricataMainLoop()\n");
-    SuricataMainLoop();
-
-    // Note that there is some thread synchronization between this
-    // function and SuricataShutdown such that they must be run
-    // concurrently at this time before either will exit.
-    if (g_worker_tv != NULL) {
-        ci_debug_printf(5, "srv_suricata: SuricataWorkerThread: SCTmThreadsSlotPacketLoopFinish()\n");
-        SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
-    }
-
-    ci_debug_printf(1, "srv_suricata: SuricataWorkerThread: EXIT\n");
-    pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
-}
-
-// Packet injection helper
-static void ReleasePacket(Packet *p)
-{
-    ci_debug_printf(1, "srv_suricata: ReleasePacket: ENTER\n");
-    if (PacketCheckAction(p, ACTION_DROP)) {
-        ci_debug_printf(1, "srv_suricata: ReleasePacket: Dropping packet!\n");
-        SCLogNotice("Dropping packet!");
-    }
-
-    // As we overode the default release function, we must release or
-    // free the packet.
-    PacketFreeOrRelease(p);
-}
-
-// Minimal 40-byte raw Layer 3 / Layer 4 structure 
-// packed to ensure precise network formatting alignment.
-struct __attribute__((__packed__)) fake_pkt_hdr {
-    struct iphdr ip;
-    struct tcphdr tcp;
-};
-
-// BuildAndInjectPacket — wrap raw bytes in a minimal Suricata Packet and push
-// it through the detection engine.
-// We present the payload as a raw TCP segment on a fake loopback device.
-// Suricata's DETECT module will match content-based signatures against the
-// raw bytes regardless of the encapsulation we claim.
-static int BuildAndInjectPacket(const char *data, int len, ci_request_t *req)
-{
-    if (!g_suri_ready || g_worker_tv == NULL) {
-        ci_debug_printf(3, "srv_suricata: BuildAndInjectPacket: engine not ready, skipping packet injection\n");
-        return -1;
-    }
-
-    Packet *p = PacketGetFromQueueOrAlloc();
-    if (unlikely(p == NULL)) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: PacketGetFromQueueOrAlloc failed\n");
-        return -1;
-    }
-
-    /* Timestamp — engine is in offline mode, so any value is fine. */
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    SCTime_t ts = SCTIME_FROM_TIMEVAL(&tv);
-
-    SCPacketSetSource(p, PKT_SRC_WIRE);
-    SCPacketSetTime(p, ts);
-
-    // LINKTYPE_RAW (DLT_RAW): raw IP, no Ethernet header.
-    // Because we are feeding LINKTYPE_RAW, Suricata expects the packet 
-    // buffer data to immediately start with a valid IP header.
-    SCPacketSetDatalink(p, LINKTYPE_RAW);
-
-    LiveDevice *dev = LiveGetDevice("suri_icap0");
-    if (dev == NULL) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: LiveGetDevice failed\n");
-        TmqhOutputPacketpool(g_worker_tv, p);
-        return -1;
-    }
-
-    ci_debug_printf(5, "srv_suricata: BuildAndInjectPacket: obtained LiveDevice for injection\n");
-
-    SCPacketSetLiveDevice(p, dev);
-    SCPacketSetReleasePacket(p, ReleasePacket);
-
-    // Construct the combined buffer containing the synthetic IP/TCP headers 
-    // followed immediately by the payload data chunks.
-    size_t header_len = sizeof(struct fake_pkt_hdr);
-    size_t total_len = header_len + len;
-    uint8_t *pkt_buf = malloc(total_len);
-    if (pkt_buf == NULL) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: allocation for pkt_buf failed\n");
-        TmqhOutputPacketpool(g_worker_tv, p);
-        return -1;
-    }
-
-    // Populate IP Header from icap extended headers for network context
-    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
-    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
-    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
-    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
-    ci_debug_printf(9, "srv_suricata: BuildAndInjectPacket: X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
-
-    struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt_buf;
-    memset(hdr, 0, header_len);
-
-    hdr->ip.version = 4;
-    hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
-    hdr->ip.tot_len = htons(total_len);
-    hdr->ip.ttl = 64;
-
-    const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
-
-    // Handle Protocol selection dynamically
-    if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
-        hdr->ip.protocol = IPPROTO_UDP;
-    } else {
-        hdr->ip.protocol = IPPROTO_TCP;     /* Default to TCP */
-    }
-
-    const char *src_ip_str = ci_icap_request_get_header(req, "X-Client-IP");
-
-    // Convert Source IP string to network byte order
-    if (src_ip_str && inet_pton(AF_INET, src_ip_str, &hdr->ip.saddr) != 1) {
-        ci_debug_printf(1, "srv_suricata: Invalid source IP string '%s', falling back\n", src_ip_str);
-        hdr->ip.saddr = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-    }
-
-    const char *dst_ip_str = ci_icap_request_get_header(req, "X-Server-IP");
-
-    // Convert Destination IP string to network byte order
-    if (dst_ip_str && inet_pton(AF_INET, dst_ip_str, &hdr->ip.daddr) != 1) {
-        ci_debug_printf(1, "srv_suricata: Invalid dest IP string '%s', falling back\n", dst_ip_str);
-        hdr->ip.daddr = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-    }
-
-    // Populate TCP/UDP Header Ports from extended headers for network context
-    // Note: The memory layout of tcphdr and udphdr both place the 16-bit 
-    // source port at byte offset 0, and dest port at byte offset 2. 
-    // Writing to hdr->tcp works perfectly for layer-4 bucketing.
-    const char *src_port_str = ci_icap_request_get_header(req, "X-Client-Port");
-
-    if (src_port_str) {
-        int s_port = atoi(src_port_str);
-        hdr->tcp.source = htons((uint16_t)s_port);
-    } else {
-        hdr->tcp.source = htons(12345);     /* Fallback */
-    }
-
-    const char *dst_port_str = ci_icap_request_get_header(req, "X-Server-Port");
-
-    if (dst_port_str) {
-        int d_port = atoi(dst_port_str);
-        hdr->tcp.dest = htons((uint16_t)d_port);
-    } else {
-        hdr->tcp.dest = htons(80);          /* Fallback */
-    }
-
-    // If it is TCP, set the data offset and flags
-    if (hdr->ip.protocol == IPPROTO_TCP) {
-        hdr->tcp.doff = 5;                  /* 5 dwords = 20 bytes, no options */
-        hdr->tcp.ack = 1;                   /* Pretend an established segment */
-    }
-
-    // Append the raw ICAP body payload bytes right after the headers
-    memcpy(pkt_buf + header_len, data, len);
-
-    // Hand over the synthesized buffer to the Suricata Packet allocation
-    if (PacketSetData(p, pkt_buf, total_len) == -1) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: PacketSetData failed\n");
-        free(pkt_buf);
-        TmqhOutputPacketpool(g_worker_tv, p);
-        return -1;
-    }
-
-    // Suricata copies the contents internally when PacketSetData is called, 
-    // meaning we must clean up our temporary layout allocation right here.
-    free(pkt_buf);
-
-    // Push packet into the detection pipeline.
-    // TmThreadsSlotProcessPkt() is the canonical library-mode injection call
-    // (see examples/lib/custom/main.c).
-    if (TmThreadsSlotProcessPkt(g_worker_tv, g_worker_tv->tm_slots, p) != TM_ECODE_OK) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: TmThreadsSlotProcessPkt failed\n");
-        TmqhOutputPacketpool(g_worker_tv, p);
-        return -1;
-    }
-
-    int rv = 0;
-
-    // QUERY VERDICT
-    if (p->action & ACTION_DROP) {
-        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: Action verdict MATCHED a blocking signature, drop reason: %s\n",
-            PacketDropReasonToString(p->drop_reason));
-        rv = 1;
-    }
-
-    LiveDevicePktsIncr(dev);
-    // Suricata owns the packet from here; do not free it ourselves
-    return rv;
-}
-
 // Per-request data structure
 struct suricata_req_data {
     char    *body_buf;   /* flat accumulation buffer                 */
@@ -320,7 +91,19 @@ struct suricata_req_data {
     int      body_cap;   /* allocated capacity                       */
     int      sent_len;   /* bytes sent so far                        */
     int      eof;        /* set when end-of-data_handler fires       */
-    int      matched;    /* non-zero if a rule fired on this request */
+    // int      matched;    /* non-zero if a rule fired on this request */
+    uint32_t client_ip;
+    unsigned int client_ip_set : 1;
+    uint16_t client_port;
+    unsigned int client_port_set : 1;
+    uint32_t server_ip;
+    unsigned int server_ip_set : 1;
+    uint16_t server_port;
+    unsigned int server_port_set : 1;
+    uint8_t  proto;
+    unsigned int proto_set : 1;
+    LiveDevice *dev;
+    unsigned int dev_set : 1;
 };
 
 enum suri_mode {mode_disallow204, mode_allow204};
@@ -358,11 +141,304 @@ static ci_service_module_t suricata_service = {
 // Macro that registers the service with c-icap's module loader
 _CI_DECLARE_SERVICE(suricata_service);
 
+// The library runmode needs at least one ThreadVars created in a runmode-setup
+// callback before SuricataInit seals the threads.
+static int SuricataRunModeSetup(void)
+{
+    ci_debug_printf(9, "srv_suricata: SuricataRunModeSetup: ENTER\n");
+
+    // TimeModeSetOffline: we feed synthetic packets with fabricated timestamps,
+    // so we do not want the engine to complain about clock skew.
+    TimeModeSetOffline();
+
+    g_worker_tv = SCRunModeLibCreateThreadVars(1 /* worker_id */);
+    if (g_worker_tv == NULL) {
+        ci_debug_printf(1, "srv_suricata: SuricataRunModeSetup: SCRunModeLibCreateThreadVars failed\n");
+        return -1;
+    }
+    return 0;
+}
+
+// Packet injection helper
+static void ReleasePacket(Packet *p)
+{
+    ci_debug_printf(9, "srv_suricata: ReleasePacket: ENTER\n");
+    if (PacketCheckAction(p, ACTION_DROP)) {
+        ci_debug_printf(5, "srv_suricata: ReleasePacket: Dropping packet!\n");
+    }
+
+    // As we overode the default release function, we must release or
+    // free the packet.
+    PacketFreeOrRelease(p);
+}
+
 static uint8_t RateFilterCallback(const Packet *p, const uint32_t sid, const uint32_t gid,
         const uint32_t rev, uint8_t original_action, uint8_t new_action, void *arg)
 {
     // Don't change the action
     return new_action;
+}
+
+// Worker thread body: keeps the Suricata slot loop alive so that packets we
+// inject via TmThreadsSlotProcessPkt() are actually processed.
+// Here we simply block inside SuricataMainLoop which returns only when the
+// engine is stopped.
+static void *SuricataWorkerThread(void *arg)
+{
+    (void)arg;
+
+    ci_debug_printf(9, "srv_suricata: SuricataWorkerThread: ENTER\n");
+
+    if (SCRunModeLibSpawnWorker(g_worker_tv) != 0) {
+        ci_debug_printf(1, "srv_suricata: SuricataWorkerThread: SCRunModeLibSpawnWorker failed\n");
+        pthread_exit((void *)(intptr_t)EXIT_FAILURE);
+    }
+
+    ci_debug_printf(5, "srv_suricata: SuricataWorkerThread: SuricataMainLoop()\n");
+    SuricataMainLoop();
+
+    // Note that there is some thread synchronization between this
+    // function and SuricataShutdown such that they must be run
+    // concurrently at this time before either will exit.
+    if (g_worker_tv != NULL) {
+        ci_debug_printf(5, "srv_suricata: SuricataWorkerThread: SCTmThreadsSlotPacketLoopFinish()\n");
+        SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
+    }
+
+    ci_debug_printf(5, "srv_suricata: SuricataWorkerThread: EXIT\n");
+    pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
+}
+
+// Minimal 40-byte raw Layer 3 / Layer 4 structure 
+// packed to ensure precise network formatting alignment.
+struct __attribute__((__packed__)) fake_pkt_hdr {
+    struct iphdr ip;
+    struct tcphdr tcp;
+};
+
+static uint32_t GetClientIP(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+    ci_debug_printf(9, "srv_suricata: GetClientIP: X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
+
+    if (!data->client_ip_set) {
+        data->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+        data->client_ip_set = 1;
+
+        const char *ip_str = ci_icap_request_get_header(req, "X-Client-IP");
+        if (ip_str) {
+            inet_pton(AF_INET, ip_str, &data->client_ip);
+        }
+    }
+
+    return data->client_ip;
+}
+
+static uint32_t GetClientPort(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+    ci_debug_printf(9, "srv_suricata: GetClientPort: X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
+
+    if (!data->client_port_set) {
+        data->client_port = htons(12345);  /* Fallback to 12345 */
+        data->client_port_set = 1;
+
+        const char *port_str = ci_icap_request_get_header(req, "X-Client-Port");
+        if (port_str) {
+            data->client_port = htons(atoi(port_str));
+        }
+    }
+
+    return data->client_port;
+}
+
+static uint32_t GetServerIP(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+    ci_debug_printf(9, "srv_suricata: GetServerIP: X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
+
+    if (!data->server_ip_set) {
+        data->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+        data->server_ip_set = 1;
+
+        const char *ip_str = ci_icap_request_get_header(req, "X-Server-IP");
+        if (ip_str) {
+            inet_pton(AF_INET, ip_str, &data->server_ip);
+        }
+    }
+
+    return data->server_ip;
+}
+
+static uint32_t GetServerPort(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+    ci_debug_printf(9, "srv_suricata: GetServerPort: X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
+
+    if (!data->server_port_set) {
+        data->server_port = htons(80);  /* Fallback to 80 */
+        data->server_port_set = 1;
+
+        const char *port_str = ci_icap_request_get_header(req, "X-Server-Port");
+        if (port_str) {
+            data->server_port = htons(atoi(port_str));
+        }
+    }
+
+    return data->server_port;
+}
+
+static uint8_t GetProto(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+    ci_debug_printf(9, "srv_suricata: GetProto: X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
+
+    if (!data->proto_set) {
+        data->proto = IPPROTO_TCP;     /* Default to TCP */
+        data->proto_set = 1;
+
+        const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
+        if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
+            data->proto = IPPROTO_UDP;
+        }
+    }
+
+    return data->proto;
+}
+
+static LiveDevice *GetLiveDevice(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+
+    if (!data->dev_set) {
+        data->dev_set = 1;
+
+        data->dev = LiveGetDevice("suri_icap0");
+        if (data->dev == NULL) {
+            ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: LiveGetDevice failed\n");
+        }
+        else {
+            ci_debug_printf(5, "srv_suricata: BuildAndInjectPacket: obtained LiveDevice for injection\n");
+        }
+    }
+
+    return data->dev;
+}
+
+// BuildAndInjectPacket — wrap raw bytes in a minimal Suricata Packet and push
+// it through the detection engine.
+// We present the payload as a raw TCP segment on a fake loopback device.
+// Suricata's DETECT module will match content-based signatures against the
+// raw bytes regardless of the encapsulation we claim.
+static int BuildAndInjectPacket(const char *data, int len, ci_request_t *req)
+{
+    if (!g_suri_ready || g_worker_tv == NULL) {
+        ci_debug_printf(3, "srv_suricata: BuildAndInjectPacket: engine not ready, skipping packet injection\n");
+        return -1;
+    }
+
+    if (GetLiveDevice(req) == NULL) {
+        return -1;
+    }
+
+    // Construct the combined buffer containing the synthetic IP/TCP headers 
+    // followed immediately by the payload data chunks.
+    size_t header_len = sizeof(struct fake_pkt_hdr);
+    size_t total_len = header_len + len;
+    uint8_t *pkt_buf = malloc(total_len);
+    if (pkt_buf == NULL) {
+        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: allocation for pkt_buf failed\n");
+        return -1;
+    }
+
+    // Populate IP Header from icap extended headers for network context
+    struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt_buf;
+    memset(hdr, 0, header_len);
+
+    hdr->ip.version = 4;
+    hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
+    hdr->ip.tot_len = htons(total_len);
+    hdr->ip.ttl = 64;
+
+    hdr->ip.protocol = GetProto(req);
+
+    hdr->ip.saddr = GetClientIP(req);
+    hdr->ip.daddr = GetServerIP(req);
+
+    // Populate TCP/UDP Header Ports from extended headers for network context
+    // Note: The memory layout of tcphdr and udphdr both place the 16-bit 
+    // source port at byte offset 0, and dest port at byte offset 2. 
+    // Writing to hdr->tcp works perfectly for layer-4 bucketing.
+    hdr->tcp.source = GetClientPort(req);
+    hdr->tcp.dest = GetServerPort(req);
+
+    // If it is TCP, set the data offset and flags
+    if (hdr->ip.protocol == IPPROTO_TCP) {
+        hdr->tcp.doff = 5;                  /* 5 dwords = 20 bytes, no options */
+        hdr->tcp.ack = 1;                   /* Pretend an established segment */
+    }
+
+    // Append the raw ICAP body payload bytes right after the headers
+    memcpy(pkt_buf + header_len, data, len);
+
+    Packet *p = PacketGetFromQueueOrAlloc();
+    if (unlikely(p == NULL)) {
+        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: PacketGetFromQueueOrAlloc failed\n");
+        free(pkt_buf);
+        return -1;
+    }
+
+    // Hand over the synthesized buffer to the Suricata Packet allocation
+    if (PacketSetData(p, pkt_buf, total_len) == -1) {
+        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: PacketSetData failed\n");
+        free(pkt_buf);
+        TmqhOutputPacketpool(g_worker_tv, p);
+        return -1;
+    }
+
+    /* Timestamp — engine is in offline mode, so any value is fine. */
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    SCTime_t ts = SCTIME_FROM_TIMEVAL(&tv);
+
+    SCPacketSetSource(p, PKT_SRC_WIRE);
+    SCPacketSetTime(p, ts);
+
+    // LINKTYPE_RAW (DLT_RAW): raw IP, no Ethernet header.
+    // Because we are feeding LINKTYPE_RAW, Suricata expects the packet 
+    // buffer data to immediately start with a valid IP header.
+    SCPacketSetDatalink(p, LINKTYPE_RAW);
+
+    SCPacketSetLiveDevice(p, GetLiveDevice(req));
+    SCPacketSetReleasePacket(p, ReleasePacket);
+
+    // Push packet into the detection pipeline.
+    // TmThreadsSlotProcessPkt() is the canonical library-mode injection call
+    // (see examples/lib/custom/main.c).
+    if (TmThreadsSlotProcessPkt(g_worker_tv, g_worker_tv->tm_slots, p) != TM_ECODE_OK) {
+        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: TmThreadsSlotProcessPkt failed\n");
+        free(pkt_buf);
+        TmqhOutputPacketpool(g_worker_tv, p);
+        return -1;
+    }
+
+    int rv = 0;
+
+    // QUERY VERDICT
+    if (p->action & ACTION_DROP) {
+        ci_debug_printf(1, "srv_suricata: BuildAndInjectPacket: Action verdict MATCHED a blocking signature, drop reason: %s\n",
+            PacketDropReasonToString(p->drop_reason));
+        rv = 1;
+    }
+
+    LiveDevicePktsIncr(GetLiveDevice(req));
+
+    // Suricata copies the contents internally when PacketSetData is called, 
+    // meaning we must clean up our temporary layout allocation right here.
+    free(pkt_buf);
+
+    // Suricata owns the packet from here; do not free it ourselves
+    return rv;
 }
 
 // Called once when the module is loaded
