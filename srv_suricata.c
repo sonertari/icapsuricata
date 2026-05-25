@@ -167,6 +167,13 @@ static void ReleasePacket(Packet *p)
         ci_debug_printf(5, "srv_suricata: ReleasePacket: Dropping packet!\n");
     }
 
+    if (p->ext_pkt != NULL) {
+        ci_debug_printf(9, "srv_suricata: ReleasePacket: Freeing packet buffer\n");
+        // This is the buffer allocated while injecting the packet
+        free(p->ext_pkt);
+        p->ext_pkt = NULL;
+    }
+
     // As we overode the default release function, we must release or
     // free the packet.
     PacketFreeOrRelease(p);
@@ -396,7 +403,7 @@ static int BuildAndInjectPacket(const char *data, int len, ci_request_t *req)
         return -1;
     }
 
-    /* Timestamp — engine is in offline mode, so any value is fine. */
+    // Timestamp — engine is in offline mode, so any value is fine.
     struct timeval tv;
     gettimeofday(&tv, NULL);
     SCTime_t ts = SCTIME_FROM_TIMEVAL(&tv);
@@ -433,11 +440,9 @@ static int BuildAndInjectPacket(const char *data, int len, ci_request_t *req)
 
     LiveDevicePktsIncr(GetLiveDevice(req));
 
-    // Suricata copies the contents internally when PacketSetData is called, 
-    // meaning we must clean up our temporary layout allocation right here.
-    free(pkt_buf);
-
-    // Suricata owns the packet from here; do not free it ourselves
+    // Suricata owns the packet from here; do not free it ourselves yet
+    // We free pkt_buf in ReleasePacket
+    // free(pkt_buf);
     return rv;
 }
 
