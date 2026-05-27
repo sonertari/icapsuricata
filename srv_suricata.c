@@ -48,6 +48,9 @@
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 // Adjust the include path in the Makefile if your installation places these headers differently
 #include <c-icap/c-icap.h>
@@ -351,13 +354,11 @@ static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
 {
     struct suricata_req_data *data = ci_service_data(req);
 
+    // ISNs are assigned in preview handler
     if (data->state == SYN) {
-        data->client_seq = 1000;  /* arbitrary initial sequence number */
-        data->client_ack = 0;
         data->state = SYN_ACK;
     }
     else if (data->state == SYN_ACK) {
-        data->server_seq = 5000;  /* arbitrary initial sequence number */
         data->server_ack = data->client_seq + 1;
         data->state = ACK;
     }
@@ -530,6 +531,9 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
 int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf)
 {
     ci_debug_printf(5, "srv_suricata: suri_init_service: initialising Suricata library...\n");
+
+    // Seed the generator for tcp seq numbers
+    srandom(time(NULL));
 
     // SuricataPreInit must be the very first call.  We pass the service name
     // as argv[0] equivalent so Suricata can locate its own binary path.
@@ -718,7 +722,7 @@ int suri_get_response_vars(ci_request_t *req)
     const char *vars = ci_icap_request_get_header(req, "X-Response-Vars");
     if (vars == NULL) {
         ci_debug_printf(7, "srv_suricata: suri_get_response_vars: No X-Response-Vars\n");
-        return 0;
+        return 1;
     }
 
     char *v = strdup(vars);
@@ -727,6 +731,7 @@ int suri_get_response_vars(ci_request_t *req)
         return -1;
     }
 
+    int rv = 0;
     char *comma = strchr(v, ',');
     if (comma) {
         comma[0] = '\0';
@@ -738,6 +743,7 @@ int suri_get_response_vars(ci_request_t *req)
         }
         else {
             ci_debug_printf(7, "srv_suricata: suri_get_response_vars: Invalid X-Response-Vars format %s\n", vars);
+            rv = 1;
         }
 
         val = strtoul(comma + 1, &endptr, 10);
@@ -746,14 +752,52 @@ int suri_get_response_vars(ci_request_t *req)
         }
         else {
             ci_debug_printf(7, "srv_suricata: suri_get_response_vars: Invalid X-Response-Vars format %s\n", vars);
+            rv = 1;
         }
     }
     else {
         ci_debug_printf(7, "srv_suricata: suri_get_response_vars: Invalid X-Response-Vars format %s\n", vars);
+        rv = 1;
     }
 
     free(v);
-    return 0;
+    return rv;
+}
+
+void suri_init_tcp_session(struct suricata_req_data *data)
+{
+    // Open the kernel's secure random device
+    // O_CLOEXEC is a good habit to prevent descriptor leaks with fork+exec, even though we don't exec here.
+    int fd = open("/dev/urandom", O_RDONLY | __O_CLOEXEC);
+    if (fd < 0) {
+        ci_debug_printf(1, "srv_suricata: suri_init_tcp_session: Failed to open /dev/urandom\n");
+        goto err;
+    }
+
+    // Read raw, unpredictable bytes directly into the sequence variables
+    size_t total_bytes = sizeof(data->client_seq) + sizeof(data->server_seq);
+    uint32_t buffer[2];
+
+    ssize_t bytes_read = read(fd, buffer, total_bytes);
+    close(fd);
+
+    if (bytes_read != (ssize_t)total_bytes) {
+        ci_debug_printf(1, "srv_suricata: suri_init_tcp_session: Failed to read enough bytes from /dev/urandom\n");
+        goto err; // Failed to read enough bytes
+    }
+
+    // Assign the secure random numbers
+    data->client_seq = buffer[0];
+    data->server_seq = buffer[1];
+    goto out;
+err:
+    // Generate valid random uint32_t values across the full 32-bit range
+    ci_debug_printf(1, "srv_suricata: suri_init_tcp_session: Generating fallback random values\n");
+    data->client_seq = (uint32_t)random();
+    data->server_seq = (uint32_t)random();
+out:
+    data->client_ack = 0;
+    data->server_ack = 0;
 }
 
 int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_request_t *req)
@@ -779,6 +823,30 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     int rv = 0;
 
     if (req->type == ICAP_REQMOD) {
+        suri_init_tcp_session(data);
+    }
+    else {
+        // For response, we assume the connection is already established
+        data->state = ESTABLISHED;
+
+        int result = 0;
+        if ((result = suri_get_response_vars(req)) == -1) {
+            rv = -1;
+            goto out;
+        } else if (result == 1) {
+            ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: No or invalid X-Response-Vars, using random seq nums\n");
+            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
+            // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
+            suri_init_tcp_session(data);
+        }
+
+        data->client_ack = data->server_seq;
+        data->server_ack = data->client_seq;
+    }
+
+    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", data->client_seq, data->server_seq);
+
+    if (req->type == ICAP_REQMOD) {
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject SYN packet\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_SYN, 1)) != 0) {
             goto out;
@@ -793,24 +861,6 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         if ((rv = InjectPacket(req, NULL, 0, TH_ACK, 1)) != 0) {
             goto out;
         }
-    }
-    else {
-        // For response, we assume the connection is already established
-        data->state = ESTABLISHED;
-
-        // Suricata does NOT detect with these fallback values, requires actual seq nums
-        // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
-        data->client_seq = 1000;
-        data->server_seq = 5000;
-
-        if (suri_get_response_vars(req) == -1) {
-            rv = -1;
-            goto out;
-        }
-
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", data->client_seq, data->server_seq);
-        data->client_ack = data->server_seq;
-        data->server_ack = data->client_seq;
     }
 
     ci_headers_list_t *http_headers_list = req->type == ICAP_REQMOD ? ci_http_request_headers(req) : ci_http_response_headers(req);
@@ -853,7 +903,10 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     }
 out:
     char resp_vars[64];
-    snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %d,%d", data->client_seq, data->server_seq);
+    if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) < 0) {
+        ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: snprintf failed\n");
+        rv = -1;
+    }
 
     if (rv == 1) {
         ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket returned block\n");
@@ -928,7 +981,10 @@ int suri_end_of_data_handler(ci_request_t *req)
         }
 out:
         char resp_vars[64];
-        snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %d,%d", data->client_seq, data->server_seq);
+        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) < 0) {
+            ci_debug_printf(1, "srv_suricata: suri_end_of_data: snprintf failed\n");
+            rv = -1;
+        }
 
         if (rv == 1) {
             ci_debug_printf(5, "srv_suricata: suri_end_of_data: InjectPacket returned block\n");
