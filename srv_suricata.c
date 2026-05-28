@@ -81,7 +81,7 @@
 
 // Maximum body bytes we reassemble per request before handing off to Suricata.
 #define SRV_SURICATA_MAX_BODY (256 * 1024)  /* 256 KiB */
-#define SRV_SURICATA_MAX_HTTP_HDRS (8 * 1024)  /* 8 KiB */
+#define SRV_SURICATA_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
 
 static ThreadVars *g_worker_tv  = NULL;
 static pthread_t   g_worker_tid = 0;
@@ -881,30 +881,42 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     }
 
     size_t http_headers_len = 0;
+    char http_headers[SRV_SURICATA_MAX_HTTP_HDRS];
+
     ci_headers_list_t *http_headers_list = req->type == ICAP_REQMOD ? ci_http_request_headers(req) : ci_http_response_headers(req);
     if (http_headers_list) {
-        char http_headers[SRV_SURICATA_MAX_HTTP_HDRS];
         http_headers_len = ci_headers_pack_to_buffer(http_headers_list, http_headers, sizeof(http_headers));
-
-        if (http_headers_len > 0) {
-            ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK http header packet, http_headers_len=%zu\n", http_headers_len);
-            if ((rv = InjectPacket(req, http_headers, http_headers_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-                goto out;
-            }
-        }
-    }
-    else {
-        ci_debug_printf(5, "srv_suricata: InjectPacket: ci_http_response_headers returned NULL\n");
-    }
-
-    if (preview_data_len > 0) {
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK body packet, preview_data_len=%d\n", preview_data_len);
-        if ((rv = InjectPacket(req, preview_data, preview_data_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+        if (http_headers_len == 0) {
+            ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: HTTP headers do not fit to buffer\n");
+            rv = -1;
             goto out;
         }
+    } else {
+        // TODO: Is this an error? But we will support protocols other than HTTP
+        ci_debug_printf(3, "srv_suricata: InjectPacket: ci_http_response_headers returned NULL\n");
     }
 
-    if (http_headers_len > 0 || preview_data_len > 0) {
+    size_t payload_len = http_headers_len + preview_data_len;
+    char *payload = malloc(payload_len);
+    if (!payload) {
+        ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: malloc for combined buffer failed\n");
+        rv = -1;
+        goto out;
+    }
+
+    // Noop if http_headers_len is 0
+    memcpy(payload, http_headers, http_headers_len);
+    if (preview_data && preview_data_len > 0) {
+        memcpy(payload + http_headers_len, preview_data, preview_data_len);
+    }
+
+    if (payload_len > 0) {
+        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK payload packet, payload_len=%zu, http_headers_len=%zu, preview_data_len=%d\n",
+            payload_len, http_headers_len, preview_data_len);
+        if ((rv = InjectPacket(req, payload, payload_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+            goto out;
+        }
+
         // ATTENTION: Suricata does not detect unless we also inject these final ACK packets to flush the flow
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
         if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 0 : 1)) != 0) {
@@ -961,8 +973,9 @@ out:
 
     // TODO: Use ring buffers as in c-icap examples
     // ci_ring_buf_write(data->body, preview_data, preview_data_len);
-    AppendToBodyBuf(data, preview_data, preview_data_len);
-
+    if (preview_data && preview_data_len > 0) {
+        AppendToBodyBuf(data, preview_data, preview_data_len);
+    }
     return CI_MOD_CONTINUE;
 }
 
