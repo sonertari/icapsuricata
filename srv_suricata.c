@@ -88,7 +88,7 @@ static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
 static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
 enum conn_state {
-    SYN,
+    SYN = 0,
     SYN_ACK,
     ACK,
     ESTABLISHED
@@ -96,11 +96,15 @@ enum conn_state {
 
 // Per-request data structure
 struct suricata_req_data {
-    char    *body_buf;   /* flat accumulation buffer                 */
-    int      body_len;   /* bytes written so far                     */
-    int      body_cap;   /* allocated capacity                       */
-    int      sent_len;   /* bytes sent so far                        */
-    int      eof;        /* set when end-of-data_handler fires       */
+    char    *body_buf;    /* flat accumulation buffer                 */
+    int      body_len;    /* bytes written so far                     */
+    int      body_cap;    /* allocated capacity                       */
+    int      sent_len;    /* bytes sent so far                        */
+
+    unsigned int eof : 1;
+    unsigned int block : 1;
+    unsigned int error : 1;
+    unsigned int sent_fin : 1;
 
     uint32_t client_ip;
     unsigned int client_ip_set : 1;
@@ -820,7 +824,8 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 
     ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Injecting %d bytes into Suricata\n", preview_data_len);
 
-    int rv = 0;
+    // Set to -2 to distinguish uninitialized state
+    int rv = -2;
 
     if (req->type == ICAP_REQMOD) {
         suri_init_tcp_session(data);
@@ -910,43 +915,45 @@ out:
 
     if (rv == 1) {
         ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket returned block\n");
+        // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
         ci_icap_add_xheader(req, "X-Response-Info: blocked");
         ci_icap_add_xheader(req, resp_vars);
-        data->eof = 1;
+        data->block = 1;
+
         // If we return CI_MOD_DONE, c-icap sends 500 Error to the client
-        // return CI_MOD_DONE;
         return MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
     }
     else if (rv == -1) {
         ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: InjectPacket failed\n");
         ci_icap_add_xheader(req, "X-Response-Info: error");
-        data->eof = 1;
+        data->error = 1;
         return CI_MOD_ERROR;
     }
-
-    ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket did not return block, continue processing\n");
-
-    if (MODE == mode_allow204) {
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Allow204 mode enabled\n");
+    else if (rv == 0) {
+        ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket did not return block, continue processing\n");
         ci_icap_add_xheader(req, "X-Response-Action: continue");
         ci_icap_add_xheader(req, resp_vars);
-        data->eof = 1;
+    }
+    else {
+        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Did not inject packet or changed state\n");
+    }
+
+    if (ci_req_hasalldata(req)) {
+        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: All data received in preview\n");
+    }
+
+    if (MODE == mode_allow204) {
+        // In allow204 mode, we assume pass if not blocked
+        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Allow204 mode enabled\n");
         return CI_MOD_ALLOW204;
     }
 
     // mode_disallow204
-    if (ci_req_hasalldata(req)) {
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: All data received in preview\n");
-        data->eof = 1;
-    }
-
-    ci_debug_printf(8, "srv_suricata: suri_check_preview_handler: Process rest of request\n");
+    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Allow204 mode disabled, process rest of request\n");
 
     // TODO: Use ring buffers as in c-icap examples
     // ci_ring_buf_write(data->body, preview_data, preview_data_len);
     AppendToBodyBuf(data, preview_data, preview_data_len);
-    ci_icap_add_xheader(req, "X-Response-Action: continue");
-    ci_icap_add_xheader(req, resp_vars);
 
     return CI_MOD_CONTINUE;
 }
@@ -955,20 +962,22 @@ int suri_end_of_data_handler(ci_request_t *req)
 {
     struct suricata_req_data *data = ci_service_data(req);
 
-    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d bytes\n", data->body_len);
+    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", data->body_len, data->block, data->error, data->eof);
+
+    // Set to -2 to distinguish uninitialized state
+    int rv = -2;
 
     // Only inject if we haven't already done so in the preview handler
-    if (!data->eof && data->body_len > 0) {
-        data->eof = 1;
-
-        int rv = 0;
-
-        if (data->body_len > 0) {
-            ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", data->body_len);
-            if ((rv = InjectPacket(req, data->body_buf, data->body_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-                goto out;
-            }
+    if (!data->block && !data->error && !data->eof && data->body_len > 0) {
+        ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", data->body_len);
+        if ((rv = InjectPacket(req, data->body_buf, data->body_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+            goto out;
         }
+    }
+
+    // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
+    if ((req->type != ICAP_REQMOD || data->error) && !data->block && !data->sent_fin) {
+        data->sent_fin = 1;
 
         ci_debug_printf(7, "srv_suricata: suri_end_of_data: Inject FIN|ACK packet to server\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_FIN|TH_ACK, 1)) != 0) {
@@ -979,41 +988,54 @@ int suri_end_of_data_handler(ci_request_t *req)
         if ((rv = InjectPacket(req, NULL, 0, TH_FIN|TH_ACK, 0)) != 0) {
             goto out;
         }
+    }
 out:
-        char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) < 0) {
-            ci_debug_printf(1, "srv_suricata: suri_end_of_data: snprintf failed\n");
-            rv = -1;
-        }
+    data->eof = 1;
 
-        if (rv == 1) {
-            ci_debug_printf(5, "srv_suricata: suri_end_of_data: InjectPacket returned block\n");
-            ci_icap_add_xheader(req, "X-Response-Info: blocked");
-            ci_icap_add_xheader(req, resp_vars);
-            return CI_MOD_DONE;
-        }
-        else if (rv == -1) {
-            ci_debug_printf(1, "srv_suricata: suri_end_of_data: InjectPacket failed\n");
-            ci_icap_add_xheader(req, "X-Response-Info: error");
-            return CI_MOD_ERROR;
-        }
+    char resp_vars[64];
+    if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) < 0) {
+        ci_debug_printf(1, "srv_suricata: suri_end_of_data: snprintf failed\n");
+        rv = -1;
+    }
 
+    if (rv == 1) {
+        ci_debug_printf(5, "srv_suricata: suri_end_of_data: InjectPacket returned block\n");
+        ci_icap_add_xheader(req, "X-Response-Info: blocked");
+        ci_icap_add_xheader(req, resp_vars);
+        return CI_MOD_DONE;
+    }
+    else if (rv == -1) {
+        ci_debug_printf(1, "srv_suricata: suri_end_of_data: InjectPacket failed\n");
+        ci_icap_add_xheader(req, "X-Response-Info: error");
+        return CI_MOD_ERROR;
+    }
+    else if (rv == 0) {
         ci_debug_printf(5, "srv_suricata: suri_end_of_data: InjectPacket did not return block, continue processing\n");
         ci_icap_add_xheader(req, "X-Response-Info: continue");
         ci_icap_add_xheader(req, resp_vars);
     }
+    else {
+        ci_debug_printf(7, "srv_suricata: suri_end_of_data: Did not inject packet or changed state\n");
+    }
 
-    data->eof = 1;
     return CI_MOD_DONE;
 }
 
 int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req)
 {
     struct suricata_req_data *d = ci_service_data(req);
-    int ret = CI_OK;
 
     ci_debug_printf(5, "srv_suricata: suri_io: ENTER rbuf=%p, wbuf=%p, rlen=%p, wlen=%p, *rlen=%d, *wlen=%d, iseof=%d, req=%p\n",
-        rbuf ? rbuf : NULL, wbuf ? wbuf : NULL, rlen ? rlen : NULL, wlen ? wlen : NULL, rlen ? *rlen : 0, wlen ? *wlen : 0, iseof, req);
+        rbuf, wbuf, rlen, wlen, rlen ? *rlen : 0, wlen ? *wlen : 0, iseof, req);
+
+    if (d->block || d->error) {
+        ci_debug_printf(5, "srv_suricata: suri_io: Skip data, block=%d, eof=%d, error=%d\n", d->block, d->eof, d->error);
+        if (wlen) {
+            ci_debug_printf(5, "srv_suricata: suri_io: Set EOF\n");
+            *wlen = CI_EOF;
+        }
+        return CI_MOD_DONE;
+    }
 
     // Simply record the new data
     if (rbuf && rlen && *rlen > 0) {
@@ -1021,12 +1043,26 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         AppendToBodyBuf(d, rbuf, *rlen);
     }
 
+    if (wbuf && wlen && *wlen > 0) {
+        if (d->sent_len < d->body_len) {
+            int copy_len = (d->body_len - d->sent_len < *wlen) ? d->body_len - d->sent_len : *wlen;
+            ci_debug_printf(5, "srv_suricata: suri_io: Send %d bytes to client\n", copy_len);
+            memcpy(wbuf, d->body_buf + d->sent_len, copy_len);
+            *wlen = copy_len;
+            d->sent_len += copy_len;
+        }
+        else {
+            *wlen = 0;
+            ci_debug_printf(5, "srv_suricata: suri_io: No more data to send, set *wlen=0\n");
+        }
+    }
+
     if (wlen && *wlen == 0 && (d->eof == 1 || iseof)) {
         ci_debug_printf(5, "srv_suricata: suri_io: Set EOF\n");
         *wlen = CI_EOF;
     }
 
-    return ret;
+    return CI_OK;
 }
 
 int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
