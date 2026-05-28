@@ -81,6 +81,7 @@
 
 // Maximum body bytes we reassemble per request before handing off to Suricata.
 #define SRV_SURICATA_MAX_BODY (256 * 1024)  /* 256 KiB */
+#define SRV_SURICATA_MAX_HTTP_HDRS (8 * 1024)  /* 8 KiB */
 
 static ThreadVars *g_worker_tv  = NULL;
 static pthread_t   g_worker_tid = 0;
@@ -146,7 +147,7 @@ int  suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request
 
 static ci_service_module_t suricata_service = {
     "suricata",                         /* mod_name                  */
-    "Suricata IDS ICAP inspection",     /* mod_short_descr           */
+    "Suricata ICAP service",            /* mod_short_descr           */
     ICAP_RESPMOD | ICAP_REQMOD,         /* mod_type                  */
     suri_init_service,                  /* mod_init_service          */
     NULL,                               /* post_init_service         */
@@ -804,6 +805,35 @@ out:
     data->server_ack = 0;
 }
 
+int suri_set_seq_numbers(ci_request_t *req)
+{
+    struct suricata_req_data *data = ci_service_data(req);
+
+    if (req->type == ICAP_REQMOD) {
+        suri_init_tcp_session(data);
+    }
+    else {
+        // For response, we assume the connection is already established
+        data->state = ESTABLISHED;
+
+        int result = 0;
+        if ((result = suri_get_response_vars(req)) == -1) {
+            return -1;
+        } else if (result == 1) {
+            ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: No or invalid X-Response-Vars, using random seq nums\n");
+            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
+            // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
+            suri_init_tcp_session(data);
+        }
+
+        data->client_ack = data->server_seq;
+        data->server_ack = data->client_seq;
+    }
+
+    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", data->client_seq, data->server_seq);
+    return 0;
+}
+
 int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_request_t *req)
 {
     ci_off_t content_len;
@@ -827,31 +857,13 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     // Set to -2 to distinguish uninitialized state
     int rv = -2;
 
-    if (req->type == ICAP_REQMOD) {
-        suri_init_tcp_session(data);
-    }
-    else {
-        // For response, we assume the connection is already established
-        data->state = ESTABLISHED;
-
-        int result = 0;
-        if ((result = suri_get_response_vars(req)) == -1) {
-            rv = -1;
-            goto out;
-        } else if (result == 1) {
-            ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: No or invalid X-Response-Vars, using random seq nums\n");
-            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
-            // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
-            suri_init_tcp_session(data);
-        }
-
-        data->client_ack = data->server_seq;
-        data->server_ack = data->client_seq;
+    if (suri_set_seq_numbers(req) == -1) {
+        rv = -1;
+        goto out;
     }
 
-    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", data->client_seq, data->server_seq);
-
     if (req->type == ICAP_REQMOD) {
+        // TCP handshake
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject SYN packet\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_SYN, 1)) != 0) {
             goto out;
@@ -868,23 +880,21 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         }
     }
 
-    ci_headers_list_t *http_headers_list = req->type == ICAP_REQMOD ? ci_http_request_headers(req) : ci_http_response_headers(req);
-
     size_t http_headers_len = 0;
-    char http_headers[SRV_SURICATA_MAX_BODY];
-
+    ci_headers_list_t *http_headers_list = req->type == ICAP_REQMOD ? ci_http_request_headers(req) : ci_http_response_headers(req);
     if (http_headers_list) {
+        char http_headers[SRV_SURICATA_MAX_HTTP_HDRS];
         http_headers_len = ci_headers_pack_to_buffer(http_headers_list, http_headers, sizeof(http_headers));
+
+        if (http_headers_len > 0) {
+            ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK http header packet, http_headers_len=%zu\n", http_headers_len);
+            if ((rv = InjectPacket(req, http_headers, http_headers_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+                goto out;
+            }
+        }
     }
     else {
-        ci_debug_printf(1, "srv_suricata: InjectPacket: ci_http_response_headers returned NULL\n");
-    }
-
-    if (http_headers_len > 0) {
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK http header packet, http_headers_len=%zu\n", http_headers_len);
-        if ((rv = InjectPacket(req, http_headers, http_headers_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-            goto out;
-        }
+        ci_debug_printf(5, "srv_suricata: InjectPacket: ci_http_response_headers returned NULL\n");
     }
 
     if (preview_data_len > 0) {
