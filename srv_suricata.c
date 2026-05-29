@@ -96,7 +96,7 @@ enum conn_state {
 };
 
 // Per-request data structure
-struct suricata_req_data {
+struct suri_req_ctx {
     char    *preview_buf;      /* flat accumulation buffer */
     int      preview_len;      /* bytes written so far     */
     int      preview_cap;      /* allocated capacity       */
@@ -250,103 +250,103 @@ struct __attribute__((__packed__)) fake_pkt_hdr {
 
 static uint32_t GetClientIP(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
     ci_debug_printf(9, "srv_suricata: GetClientIP: X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
 
-    if (!data->client_ip_set) {
-        data->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-        data->client_ip_set = 1;
+    if (!ctx->client_ip_set) {
+        ctx->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+        ctx->client_ip_set = 1;
 
         const char *ip_str = ci_icap_request_get_header(req, "X-Client-IP");
         if (ip_str) {
-            inet_pton(AF_INET, ip_str, &data->client_ip);
+            inet_pton(AF_INET, ip_str, &ctx->client_ip);
         }
     }
 
-    return data->client_ip;
+    return ctx->client_ip;
 }
 
 static uint32_t GetClientPort(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
     ci_debug_printf(9, "srv_suricata: GetClientPort: X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
 
-    if (!data->client_port_set) {
-        data->client_port = htons(12345);  /* Fallback to 12345 */
-        data->client_port_set = 1;
+    if (!ctx->client_port_set) {
+        ctx->client_port = htons(12345);  /* Fallback to 12345 */
+        ctx->client_port_set = 1;
 
         const char *port_str = ci_icap_request_get_header(req, "X-Client-Port");
         if (port_str) {
-            data->client_port = htons(atoi(port_str));
+            ctx->client_port = htons(atoi(port_str));
         }
     }
 
-    return data->client_port;
+    return ctx->client_port;
 }
 
 static uint32_t GetServerIP(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
     ci_debug_printf(9, "srv_suricata: GetServerIP: X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
 
-    if (!data->server_ip_set) {
-        data->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-        data->server_ip_set = 1;
+    if (!ctx->server_ip_set) {
+        ctx->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+        ctx->server_ip_set = 1;
 
         const char *ip_str = ci_icap_request_get_header(req, "X-Server-IP");
         if (ip_str) {
-            inet_pton(AF_INET, ip_str, &data->server_ip);
+            inet_pton(AF_INET, ip_str, &ctx->server_ip);
         }
     }
 
-    return data->server_ip;
+    return ctx->server_ip;
 }
 
 static uint32_t GetServerPort(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
     ci_debug_printf(9, "srv_suricata: GetServerPort: X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
 
-    if (!data->server_port_set) {
-        data->server_port = htons(80);  /* Fallback to 80 */
-        data->server_port_set = 1;
+    if (!ctx->server_port_set) {
+        ctx->server_port = htons(80);  /* Fallback to 80 */
+        ctx->server_port_set = 1;
 
         const char *port_str = ci_icap_request_get_header(req, "X-Server-Port");
         if (port_str) {
-            data->server_port = htons(atoi(port_str));
+            ctx->server_port = htons(atoi(port_str));
         }
     }
 
-    return data->server_port;
+    return ctx->server_port;
 }
 
 static uint8_t GetProto(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
     ci_debug_printf(9, "srv_suricata: GetProto: X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
 
-    if (!data->proto_set) {
-        data->proto = IPPROTO_TCP;     /* Default to TCP */
-        data->proto_set = 1;
+    if (!ctx->proto_set) {
+        ctx->proto = IPPROTO_TCP;     /* Default to TCP */
+        ctx->proto_set = 1;
 
         const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
         if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
-            data->proto = IPPROTO_UDP;
+            ctx->proto = IPPROTO_UDP;
         }
     }
 
-    return data->proto;
+    return ctx->proto;
 }
 
 static LiveDevice *GetLiveDevice(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
-    if (!data->dev_set) {
-        data->dev_set = 1;
+    if (!ctx->dev_set) {
+        ctx->dev_set = 1;
 
-        data->dev = LiveGetDevice("suri_icap0");
-        if (data->dev == NULL) {
+        ctx->dev = LiveGetDevice("suri_icap0");
+        if (ctx->dev == NULL) {
             ci_debug_printf(1, "srv_suricata: GetLiveDevice: LiveGetDevice failed\n");
         }
         else {
@@ -354,54 +354,54 @@ static LiveDevice *GetLiveDevice(ci_request_t *req)
         }
     }
 
-    return data->dev;
+    return ctx->dev;
 }
 
 static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     // ISNs are assigned in preview handler
-    if (data->state == SYN) {
-        data->state = SYN_ACK;
+    if (ctx->state == SYN) {
+        ctx->state = SYN_ACK;
     }
-    else if (data->state == SYN_ACK) {
-        data->server_ack = data->client_seq + 1;  // SYN consumes one sequence number
-        data->state = ACK;
+    else if (ctx->state == SYN_ACK) {
+        ctx->server_ack = ctx->client_seq + 1;  // SYN consumes one sequence number
+        ctx->state = ACK;
     }
-    else if (data->state == ACK) {
-        data->client_seq = data->server_ack;
-        data->client_ack = data->server_seq + 1;
-        data->state = ESTABLISHED;
+    else if (ctx->state == ACK) {
+        ctx->client_seq = ctx->server_ack;
+        ctx->client_ack = ctx->server_seq + 1;
+        ctx->state = ESTABLISHED;
     }
-    else if (data->state == ESTABLISHED) {
+    else if (ctx->state == ESTABLISHED) {
         if (toserver) {
-            data->client_seq = data->server_ack;
-            data->server_ack = data->client_seq + len;
+            ctx->client_seq = ctx->server_ack;
+            ctx->server_ack = ctx->client_seq + len;
         }
         else {
-            data->server_seq = data->client_ack;
-            data->client_ack = data->server_seq + len;
+            ctx->server_seq = ctx->client_ack;
+            ctx->client_ack = ctx->server_seq + len;
         }
     }
-    else if (data->state == FIN) {
+    else if (ctx->state == FIN) {
         if (toserver) {
-            data->client_seq = data->server_ack;
-            data->server_ack = data->client_seq + 1;  // FIN consumes one sequence number
+            ctx->client_seq = ctx->server_ack;
+            ctx->server_ack = ctx->client_seq + 1;  // FIN consumes one sequence number
         }
         else {
-            data->server_seq = data->client_ack;
-            data->client_ack = data->server_seq + 1;
+            ctx->server_seq = ctx->client_ack;
+            ctx->client_ack = ctx->server_seq + 1;
         }
     }
     ci_debug_printf(9, "srv_suricata: GetSeqAck: client_seq=%u, client_ack=%u, server_seq=%u, server_ack=%u\n",
-                    data->client_seq, data->client_ack, data->server_seq, data->server_ack);
+                    ctx->client_seq, ctx->client_ack, ctx->server_seq, ctx->server_ack);
 }
 
 // Create emulated packet
 static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver, size_t *pkt_len)
 {
-    struct suricata_req_data *d = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     size_t header_len = sizeof(struct fake_pkt_hdr);
     *pkt_len = header_len + data_len;
@@ -442,8 +442,8 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
 
         GetSeqAck(req, data_len, toserver);
 
-        hdr->tcp.th_seq = toserver ? htonl(d->client_seq) : htonl(d->server_seq);
-        hdr->tcp.th_ack = toserver ? htonl(d->client_ack) : htonl(d->server_ack);
+        hdr->tcp.th_seq = toserver ? htonl(ctx->client_seq) : htonl(ctx->server_seq);
+        hdr->tcp.th_ack = toserver ? htonl(ctx->client_ack) : htonl(ctx->server_ack);
 
         // Revert byte order by htonl() for printing
         ci_debug_printf(7, "srv_suricata: CreatePacket: Set %s seq=%u, ack=%u\n", toserver ? "client" : "server", htonl(hdr->tcp.th_seq), htonl(hdr->tcp.th_ack));
@@ -665,75 +665,75 @@ void *suri_init_request_data(ci_request_t *req)
 {
     ci_debug_printf(1, "srv_suricata: suri_init_request_data: ENTER\n");
 
-    struct suricata_req_data *d = calloc(1, sizeof(*d));
-    if (!d) {
+    struct suri_req_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
         ci_debug_printf(1, "srv_suricata: suri_init_request_data: calloc for request data failed\n");
         return NULL;
     }
 
     if (ci_req_hasbody(req)) {
-        d->preview_cap = 64 * 1024;  /* start with 64 KiB, grown in suri_io */
-        d->preview_buf = malloc(d->preview_cap);
-        if (!d->preview_buf) {
+        ctx->preview_cap = 64 * 1024;  /* start with 64 KiB, grown in suri_io */
+        ctx->preview_buf = malloc(ctx->preview_cap);
+        if (!ctx->preview_buf) {
             ci_debug_printf(1, "srv_suricata: suri_init_request_data: malloc for body buf failed\n");
-            free(d);
+            free(ctx);
             return NULL;
         }
     }
 
-    return d;
+    return ctx;
 }
 
 void suri_release_request_data(void *data)
 {
     ci_debug_printf(5, "srv_suricata: suri_release_request_data: ENTER\n");
 
-    struct suricata_req_data *d = (struct suricata_req_data *)data;
-    if (!d)
+    struct suri_req_ctx *ctx = (struct suri_req_ctx *)data;
+    if (!ctx)
         return;
-    ci_debug_printf(5, "srv_suricata: suri_release_request_data: body_len=%d\n", d->preview_len);
-    free(d->preview_buf);
-    free(d);
+    ci_debug_printf(5, "srv_suricata: suri_release_request_data: body_len=%d\n", ctx->preview_len);
+    free(ctx->preview_buf);
+    free(ctx);
 }
 
-static int AppendToBodyBuf(struct suricata_req_data *data, const char *buf, int len)
+static int AppendToBodyBuf(struct suri_req_ctx *ctx, const char *buf, int len)
 {
     if (!buf || len <= 0)
         return 0;
 
     // Enforce the hard cap
-    if (data->preview_len >= SRV_SURICATA_MAX_PREVIEW_SIZE) {
+    if (ctx->preview_len >= SRV_SURICATA_MAX_PREVIEW_SIZE) {
         ci_debug_printf(4, "srv_suricata: body cap reached, dropping chunk\n");
         return 0;
     }
-    if (data->preview_len + len > SRV_SURICATA_MAX_PREVIEW_SIZE)
-        len = SRV_SURICATA_MAX_PREVIEW_SIZE - data->preview_len;
+    if (ctx->preview_len + len > SRV_SURICATA_MAX_PREVIEW_SIZE)
+        len = SRV_SURICATA_MAX_PREVIEW_SIZE - ctx->preview_len;
 
     // Grow buffer if needed
-    if (data->preview_len + len > data->preview_cap) {
-        int new_cap = data->preview_cap * 2;
-        while (new_cap < data->preview_len + len)
+    if (ctx->preview_len + len > ctx->preview_cap) {
+        int new_cap = ctx->preview_cap * 2;
+        while (new_cap < ctx->preview_len + len)
             new_cap *= 2;
         if (new_cap > SRV_SURICATA_MAX_PREVIEW_SIZE)
             new_cap = SRV_SURICATA_MAX_PREVIEW_SIZE;
 
-        char *tmp = realloc(data->preview_buf, new_cap);
+        char *tmp = realloc(ctx->preview_buf, new_cap);
         if (!tmp) {
             ci_debug_printf(1, "srv_suricata: realloc failed\n");
             return -1;
         }
-        data->preview_buf = tmp;
-        data->preview_cap = new_cap;
+        ctx->preview_buf = tmp;
+        ctx->preview_cap = new_cap;
     }
 
-    memcpy(data->preview_buf + data->preview_len, buf, len);
-    data->preview_len += len;
+    memcpy(ctx->preview_buf + ctx->preview_len, buf, len);
+    ctx->preview_len += len;
     return len;
 }
 
 int suri_get_response_vars(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     const char *vars = ci_icap_request_get_header(req, "X-Response-Vars");
     if (vars == NULL) {
@@ -755,7 +755,7 @@ int suri_get_response_vars(ci_request_t *req)
         char *endptr;
         unsigned long val = strtoul(v, &endptr, 10);
         if (endptr != v && *endptr == '\0' && val < 4294967296) {
-            data->client_seq = val;
+            ctx->client_seq = val;
         }
         else {
             ci_debug_printf(7, "srv_suricata: suri_get_response_vars: Invalid X-Response-Vars format %s\n", vars);
@@ -764,7 +764,7 @@ int suri_get_response_vars(ci_request_t *req)
 
         val = strtoul(comma + 1, &endptr, 10);
         if (endptr != comma + 1 && *endptr == '\0' && val < 4294967296) {
-            data->server_seq = val;
+            ctx->server_seq = val;
         }
         else {
             ci_debug_printf(7, "srv_suricata: suri_get_response_vars: Invalid X-Response-Vars format %s\n", vars);
@@ -780,7 +780,7 @@ int suri_get_response_vars(ci_request_t *req)
     return rv;
 }
 
-void suri_init_tcp_session(struct suricata_req_data *data)
+void suri_init_tcp_session(struct suri_req_ctx *ctx)
 {
     // Open the kernel's secure random device
     // O_CLOEXEC is a good habit to prevent descriptor leaks with fork+exec, even though we don't exec here.
@@ -791,7 +791,7 @@ void suri_init_tcp_session(struct suricata_req_data *data)
     }
 
     // Read raw, unpredictable bytes directly into the sequence variables
-    size_t total_bytes = sizeof(data->client_seq) + sizeof(data->server_seq);
+    size_t total_bytes = sizeof(ctx->client_seq) + sizeof(ctx->server_seq);
     uint32_t buffer[2];
 
     ssize_t bytes_read = read(fd, buffer, total_bytes);
@@ -803,29 +803,29 @@ void suri_init_tcp_session(struct suricata_req_data *data)
     }
 
     // Assign the secure random numbers
-    data->client_seq = buffer[0];
-    data->server_seq = buffer[1];
+    ctx->client_seq = buffer[0];
+    ctx->server_seq = buffer[1];
     goto out;
 err:
     // Generate valid random uint32_t values across the full 32-bit range
     ci_debug_printf(1, "srv_suricata: suri_init_tcp_session: Generating fallback random values\n");
-    data->client_seq = (uint32_t)random();
-    data->server_seq = (uint32_t)random();
+    ctx->client_seq = (uint32_t)random();
+    ctx->server_seq = (uint32_t)random();
 out:
-    data->client_ack = 0;
-    data->server_ack = 0;
+    ctx->client_ack = 0;
+    ctx->server_ack = 0;
 }
 
 int suri_set_seq_numbers(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     if (req->type == ICAP_REQMOD) {
-        suri_init_tcp_session(data);
+        suri_init_tcp_session(ctx);
     }
     else {
         // For response, we assume the connection is already established
-        data->state = ESTABLISHED;
+        ctx->state = ESTABLISHED;
 
         int result = 0;
         if ((result = suri_get_response_vars(req)) == -1) {
@@ -834,14 +834,14 @@ int suri_set_seq_numbers(ci_request_t *req)
             ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: No or invalid X-Response-Vars, using random seq nums\n");
             // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod
             // but we will continue with these defaults if X-Response-Vars is not provided or has invalid format
-            suri_init_tcp_session(data);
+            suri_init_tcp_session(ctx);
         }
 
-        data->client_ack = data->server_seq;
-        data->server_ack = data->client_seq;
+        ctx->client_ack = ctx->server_seq;
+        ctx->server_ack = ctx->client_seq;
     }
 
-    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", data->client_seq, data->server_seq);
+    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Set client_seq=%u, server_seq=%u\n", ctx->client_seq, ctx->server_seq);
     return 0;
 }
 
@@ -849,7 +849,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 {
     ci_off_t content_len;
 
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     content_len = ci_http_content_length(req);
     ci_debug_printf(9, "We expect to read :%" PRINTF_OFF_T " body data\n", (CAST_OFF_T) content_len);
@@ -945,13 +945,13 @@ out:
         ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket returned block\n");
         // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
         ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        data->block = 1;
+        ctx->block = 1;
 
         // If we return CI_MOD_DONE, c-icap sends 500 Error to the client
         return MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
     case 0:
         char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) >= 0) {
+        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
             ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket did not return block, continue processing\n");
             ci_icap_add_xheader(req, "X-Response-Action: continue");
             ci_icap_add_xheader(req, resp_vars);
@@ -962,7 +962,7 @@ out:
     case -1:
         ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: InjectPacket failed\n");
         ci_icap_add_xheader(req, "X-Response-Info: error");
-        data->error = 1;
+        ctx->error = 1;
         return CI_MOD_ERROR;
     default:
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Did not inject packet or changed state\n");
@@ -985,33 +985,33 @@ out:
     // TODO: Use ring buffers as in c-icap examples
     // ci_ring_buf_write(data->body, preview_data, preview_data_len);
     if (preview_data && preview_data_len > 0) {
-        AppendToBodyBuf(data, preview_data, preview_data_len);
+        AppendToBodyBuf(ctx, preview_data, preview_data_len);
     }
     return CI_MOD_CONTINUE;
 }
 
 int suri_end_of_data_handler(ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
-    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", data->preview_len, data->block, data->error, data->eof);
+    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", ctx->preview_len, ctx->block, ctx->error, ctx->eof);
 
     // Set to -2 to distinguish uninitialized state
     int rv = -2;
 
     // Only inject if we haven't already done so in the preview handler or io callback
-    if (!data->block && !data->error && !data->eof && data->preview_len > 0 && data->preview_sent_len < data->preview_len) {
-        ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", data->preview_len - data->preview_sent_len);
-        if ((rv = InjectPacket(req, data->preview_buf + data->preview_sent_len, data->preview_len - data->preview_sent_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+    if (!ctx->block && !ctx->error && !ctx->eof && ctx->preview_len > 0 && ctx->preview_sent_len < ctx->preview_len) {
+        ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", ctx->preview_len - ctx->preview_sent_len);
+        if ((rv = InjectPacket(req, ctx->preview_buf + ctx->preview_sent_len, ctx->preview_len - ctx->preview_sent_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
             goto out;
         }
     }
 
     // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
-    if ((req->type != ICAP_REQMOD || data->error) && !data->block && !data->sent_fin) {
-        data->sent_fin = 1;
+    if ((req->type != ICAP_REQMOD || ctx->error) && !ctx->block && !ctx->sent_fin) {
+        ctx->sent_fin = 1;
 
-        data->state = FIN;
+        ctx->state = FIN;
         ci_debug_printf(7, "srv_suricata: suri_end_of_data: Inject FIN|ACK packet to server\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_FIN|TH_ACK, 1)) != 0) {
             goto out;
@@ -1023,17 +1023,17 @@ int suri_end_of_data_handler(ci_request_t *req)
         }
     }
 out:
-    data->eof = 1;
+    ctx->eof = 1;
 
     switch (rv) {
     case 1:
         ci_debug_printf(5, "srv_suricata: suri_end_of_data_handler: InjectPacket returned block\n");
         ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        data->block = 1;
+        ctx->block = 1;
         break;
     case 0:
         char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) >= 0) {
+        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
             ci_debug_printf(5, "srv_suricata: suri_end_of_data_handler: InjectPacket did not return block, continue processing\n");
             ci_icap_add_xheader(req, "X-Response-Info: continue");
             ci_icap_add_xheader(req, resp_vars);
@@ -1044,7 +1044,7 @@ out:
     case -1:
         ci_debug_printf(1, "srv_suricata: suri_end_of_data_handler: InjectPacket failed\n");
         ci_icap_add_xheader(req, "X-Response-Info: error");
-        data->error = 1;
+        ctx->error = 1;
         return CI_MOD_ERROR;
     default:
         ci_debug_printf(7, "srv_suricata: suri_end_of_data_handler: Did not inject packet or changed state\n");
@@ -1056,13 +1056,13 @@ out:
 
 int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req)
 {
-    struct suricata_req_data *data = ci_service_data(req);
+    struct suri_req_ctx *ctx = ci_service_data(req);
 
     ci_debug_printf(5, "srv_suricata: suri_io: ENTER rbuf=%p, wbuf=%p, rlen=%p, wlen=%p, *rlen=%d, *wlen=%d, iseof=%d, req=%p\n",
         rbuf, wbuf, rlen, wlen, rlen ? *rlen : 0, wlen ? *wlen : 0, iseof, req);
 
-    if (data->block || data->error) {
-        ci_debug_printf(5, "srv_suricata: suri_io: Skip data, block=%d, eof=%d, error=%d\n", data->block, data->eof, data->error);
+    if (ctx->block || ctx->error) {
+        ci_debug_printf(5, "srv_suricata: suri_io: Skip data, block=%d, eof=%d, error=%d\n", ctx->block, ctx->eof, ctx->error);
         if (wlen) {
             ci_debug_printf(5, "srv_suricata: suri_io: Set EOF\n");
             *wlen = CI_EOF;
@@ -1077,13 +1077,13 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         int wbuf_size = *wlen;
         int preview_buf_copy_len = 0;
 
-        if (data->preview_sent_len < data->preview_len) {
-            preview_buf_copy_len = (data->preview_len - data->preview_sent_len < wbuf_size) ? data->preview_len - data->preview_sent_len : wbuf_size;
+        if (ctx->preview_sent_len < ctx->preview_len) {
+            preview_buf_copy_len = (ctx->preview_len - ctx->preview_sent_len < wbuf_size) ? ctx->preview_len - ctx->preview_sent_len : wbuf_size;
 
             ci_debug_printf(5, "srv_suricata: suri_io: Send %d bytes from preview_buf to client\n", preview_buf_copy_len);
-            memcpy(wbuf, data->preview_buf + data->preview_sent_len, preview_buf_copy_len);
+            memcpy(wbuf, ctx->preview_buf + ctx->preview_sent_len, preview_buf_copy_len);
 
-            data->preview_sent_len += preview_buf_copy_len;
+            ctx->preview_sent_len += preview_buf_copy_len;
         }
 
         *wlen = preview_buf_copy_len;
@@ -1100,7 +1100,7 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
 
         int inject_len = *wlen - preview_buf_copy_len;
         if (inject_len > 0) {
-            data->sent_len_since_ack += inject_len;
+            ctx->sent_len_since_ack += inject_len;
             ci_debug_printf(5, "srv_suricata: suri_io: Injecting %d bytes into Suricata\n", inject_len);
             if ((rv = InjectPacket(req, wbuf + preview_buf_copy_len, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
                 *wlen = 0;  // Tell c-icap not to send wbuf to the client
@@ -1116,8 +1116,8 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         *rlen = 0;  // Tell c-icap we have not consumed any data
     }
     else if (wbuf && wlen && *wlen > 0) {
-        if (data->preview_sent_len < data->preview_len) {
-            ci_debug_printf(5, "srv_suricata: suri_io: Have data to send, preview_len=%d, sent_len=%d\n", data->preview_len, data->preview_sent_len);
+        if (ctx->preview_sent_len < ctx->preview_len) {
+            ci_debug_printf(5, "srv_suricata: suri_io: Have data to send, preview_len=%d, sent_len=%d\n", ctx->preview_len, ctx->preview_sent_len);
         }
         else {
             ci_debug_printf(5, "srv_suricata: suri_io: No more data to send, set *wlen=0\n");
@@ -1125,7 +1125,7 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         }
     }
 
-    if (wlen && *wlen == 0 && (data->eof == 1 || iseof)) {
+    if (wlen && *wlen == 0 && (ctx->eof == 1 || iseof)) {
         ci_debug_printf(5, "srv_suricata: suri_io: Set EOF\n");
         *wlen = CI_EOF;
     }
@@ -1135,10 +1135,10 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
 
     // This io function may be called after end_of_data_handler and when we set CI_EOF above,
     // so do not inject duplicate ACK packets, hence !data->sent_fin and data->sent_len_since_ack > 0
-    if ((data->sent_len_since_ack >= ACK_WINDOW_SIZE || (iseof && data->sent_len_since_ack > 0)) && !data->sent_fin) {
+    if ((ctx->sent_len_since_ack >= ACK_WINDOW_SIZE || (iseof && ctx->sent_len_since_ack > 0)) && !ctx->sent_fin) {
         ci_debug_printf(7, "srv_suricata: suri_io: Reached ACK window size or iseof, injecting ACK packets, sent_len_since_ack=%d, iseof=%d, sent_fin=%d\n",
-            data->sent_len_since_ack, iseof, data->sent_fin);
-        data->sent_len_since_ack = 0;
+            ctx->sent_len_since_ack, iseof, ctx->sent_fin);
+        ctx->sent_len_since_ack = 0;
 
         // ATTENTION: Suricata does not detect unless we also inject these final ACK packets to flush the flow
         ci_debug_printf(7, "srv_suricata: suri_io: Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
@@ -1158,11 +1158,11 @@ out:
     case 1:
         ci_debug_printf(5, "srv_suricata: suri_io: InjectPacket returned block\n");
         ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        data->block = 1;
+        ctx->block = 1;
         return CI_MOD_DONE;
     case 0:
         char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", data->client_seq, data->server_seq) >= 0) {
+        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
             ci_debug_printf(5, "srv_suricata: suri_io: InjectPacket did not return block, continue processing\n");
             ci_icap_add_xheader(req, "X-Response-Info: continue");
             ci_icap_add_xheader(req, resp_vars);
@@ -1173,7 +1173,7 @@ out:
     case -1:
         ci_debug_printf(1, "srv_suricata: suri_io: InjectPacket failed\n");
         ci_icap_add_xheader(req, "X-Response-Info: error");
-        data->error = 1;
+        ctx->error = 1;
         return CI_MOD_ERROR;
     default:
         ci_debug_printf(7, "srv_suricata: suri_io: Did not inject packet or changed state\n");
