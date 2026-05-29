@@ -973,16 +973,7 @@ out:
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: All data received in preview\n");
     }
 
-    if (MODE == mode_allow204) {
-        // In allow204 mode, we assume pass if not blocked
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Allow204 mode enabled\n");
-        return CI_MOD_ALLOW204;
-    }
-
-    // mode_disallow204
-    ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Allow204 mode disabled, process rest of request\n");
-
-    // TODO: Use ring buffers as in c-icap examples
+    // TODO: Use ring buffers as in c-icap examples?
     // ci_ring_buf_write(data->body, preview_data, preview_data_len);
     if (preview_data && preview_data_len > 0) {
         AppendToBodyBuf(ctx, preview_data, preview_data_len);
