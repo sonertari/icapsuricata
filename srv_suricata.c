@@ -845,6 +845,39 @@ int suri_set_seq_numbers(ci_request_t *req)
     return 0;
 }
 
+int suri_handle_inspect_result(ci_request_t *req, int rv)
+{
+    struct suri_req_ctx *ctx = ci_service_data(req);
+
+    switch (rv) {
+    case 1:
+        ci_debug_printf(5, "srv_suricata: suri_handle_inspect_result: InjectPacket returned block\n");
+        ci_icap_add_xheader(req, "X-Response-Info: blocked");
+        ctx->block = 1;
+        break;
+    case 0:
+        char resp_vars[64];
+        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
+            ci_debug_printf(5, "srv_suricata: suri_handle_inspect_result: InjectPacket did not return block, continue processing\n");
+            ci_icap_add_xheader(req, "X-Response-Info: continue");
+            ci_icap_add_xheader(req, resp_vars);
+            break;
+        }
+        ci_debug_printf(1, "srv_suricata: suri_handle_inspect_result: snprintf failed\n");
+        // fall through to error handling
+    case -1:
+        ci_debug_printf(1, "srv_suricata: suri_handle_inspect_result: InjectPacket failed\n");
+        ci_icap_add_xheader(req, "X-Response-Info: error");
+        ctx->error = 1;
+        return CI_MOD_ERROR;
+    default:
+        ci_debug_printf(7, "srv_suricata: suri_handle_inspect_result: Did not inject packet or changed state\n");
+        break;
+    }
+
+    return CI_MOD_DONE;
+}
+
 int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_request_t *req)
 {
     ci_off_t content_len;
@@ -940,44 +973,28 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         }
     }
 out:
-    switch (rv) {
-    case 1:
-        ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket returned block\n");
-        // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
-        ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        ctx->block = 1;
+    int result = suri_handle_inspect_result(req, rv);
 
+    if (rv == 1) {
+        // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
         // If we return CI_MOD_DONE, c-icap sends 500 Error to the client
         return MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
-    case 0:
-        char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
-            ci_debug_printf(5, "srv_suricata: suri_check_preview_handler: InjectPacket did not return block, continue processing\n");
-            ci_icap_add_xheader(req, "X-Response-Action: continue");
-            ci_icap_add_xheader(req, resp_vars);
-            break;
-        }
-        ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: snprintf failed\n");
-        // fall through to error handling
-    case -1:
-        ci_debug_printf(1, "srv_suricata: suri_check_preview_handler: InjectPacket failed\n");
-        ci_icap_add_xheader(req, "X-Response-Info: error");
-        ctx->error = 1;
+    }
+
+    if (result == CI_MOD_ERROR) {
         return CI_MOD_ERROR;
-    default:
-        ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Did not inject packet or changed state\n");
-        break;
     }
 
     if (ci_req_hasalldata(req)) {
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: All data received in preview\n");
     }
 
-    // TODO: Use ring buffers as in c-icap examples?
-    // ci_ring_buf_write(data->body, preview_data, preview_data_len);
     if (preview_data && preview_data_len > 0) {
+        // TODO: Use ring buffers as in c-icap examples?
+        // ci_ring_buf_write(data->body, preview_data, preview_data_len);
         AppendToBodyBuf(ctx, preview_data, preview_data_len);
     }
+
     return CI_MOD_CONTINUE;
 }
 
@@ -1015,34 +1032,7 @@ int suri_end_of_data_handler(ci_request_t *req)
     }
 out:
     ctx->eof = 1;
-
-    switch (rv) {
-    case 1:
-        ci_debug_printf(5, "srv_suricata: suri_end_of_data_handler: InjectPacket returned block\n");
-        ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        ctx->block = 1;
-        break;
-    case 0:
-        char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
-            ci_debug_printf(5, "srv_suricata: suri_end_of_data_handler: InjectPacket did not return block, continue processing\n");
-            ci_icap_add_xheader(req, "X-Response-Info: continue");
-            ci_icap_add_xheader(req, resp_vars);
-            break;
-        }
-        ci_debug_printf(1, "srv_suricata: suri_end_of_data_handler: snprintf failed\n");
-        // fall through to error handling
-    case -1:
-        ci_debug_printf(1, "srv_suricata: suri_end_of_data_handler: InjectPacket failed\n");
-        ci_icap_add_xheader(req, "X-Response-Info: error");
-        ctx->error = 1;
-        return CI_MOD_ERROR;
-    default:
-        ci_debug_printf(7, "srv_suricata: suri_end_of_data_handler: Did not inject packet or changed state\n");
-        break;
-    }
-
-    return CI_MOD_DONE;
+    return suri_handle_inspect_result(req, rv);
 }
 
 int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req)
@@ -1145,33 +1135,11 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         }
     }
 out:
-    switch (rv) {
-    case 1:
-        ci_debug_printf(5, "srv_suricata: suri_io: InjectPacket returned block\n");
-        ci_icap_add_xheader(req, "X-Response-Info: blocked");
-        ctx->block = 1;
-        return CI_MOD_DONE;
-    case 0:
-        char resp_vars[64];
-        if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
-            ci_debug_printf(5, "srv_suricata: suri_io: InjectPacket did not return block, continue processing\n");
-            ci_icap_add_xheader(req, "X-Response-Info: continue");
-            ci_icap_add_xheader(req, resp_vars);
-            break;
-        }
-        ci_debug_printf(1, "srv_suricata: suri_io: snprintf failed\n");
-        // fall through to error handling
-    case -1:
-        ci_debug_printf(1, "srv_suricata: suri_io: InjectPacket failed\n");
-        ci_icap_add_xheader(req, "X-Response-Info: error");
-        ctx->error = 1;
-        return CI_MOD_ERROR;
-    default:
-        ci_debug_printf(7, "srv_suricata: suri_io: Did not inject packet or changed state\n");
-        break;
+    int result = suri_handle_inspect_result(req, rv);
+    if (result == CI_MOD_DONE && (rv == 0 || rv == -2)) {
+        return CI_OK;
     }
-
-    return CI_OK;
+    return result;
 }
 
 int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
