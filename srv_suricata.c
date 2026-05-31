@@ -28,10 +28,10 @@
  *   - Suricata is initialised in library mode (RUNMODE_LIB) inside the module's
  *     init function, loading a single hard-coded alert rule.
  *   - Incoming HTTP body chunks (preview + streaming IO) are reassembled into a
- *     flat buffer and injected into Suricata as synthetic TCP payload packets so
- *     the detection engine can evaluate them.
+ *     buffer and injected into Suricata as synthetic TCP payload packets so the
+ *     detection engine can evaluate them.
  *   - On a rule match Suricata fires its normal alert path; we additionally hook
- *     the PacketAlert callback to print a c-icap debug line.
+ *     the PacketAlert callback to return the verdict to client.
  *
  * Build:
  *   See Makefile in the same directory.

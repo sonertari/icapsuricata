@@ -1,19 +1,63 @@
-# srv_suricata — c-icap × libsuricata
+# icapsuricata — c-icap × libsuricata
 
-> C-icap service with the Suricata detection engine running in library mode.
+> A high-performance c-icap service integrating the Suricata intrusion detection engine running in library mode (`libsuricata`) to provide deep content inspection and inline threat prevention for proxy ecosystems.
 
----
+## What It Does
 
-## Directory layout
+`icapsuricata` is a service plugin for the `c-icap` server architecture. It bridges the gap between proxy infrastructure, such as [**SSLproxy**](https://github.com/sonertari/SSLproxy), and the **Suricata IPS/IDS engine**.
 
+Unlike traditional setups, `icapsuricata` executes Suricata **in-line as a shared library (`libsuricata`)** within the proxy's execution context.
+
+[This discussion at Suricata forum](https://forum.suricata.io/t/rethinking-the-sslproxy-suricata-integration-divert-mode-is-a-dead-end-for-h2-h3/6195) explains why `icapsuricata` is necessary for passing network context to Suricata and for deep content inspection of HTTP/2 and HTTP/3 traffic.
+
+## How It Works (Under the Hood)
+
+The core challenge of running an interface-based packet inspection engine inside a proxy service callback is state synchronization. For example, the proxy must pass network context to Suricata for correct application of IDS signatures. Also, web proxies pass linear data buffers, whereas Suricata expects raw network layers. `icapsuricata` solves such issues through the following primary pillars:
+
+### Network Context: Extended ICAP
+`icapsuricata` expects ICAP clients to provide network context via the following extended headers:
+
+- `X-Client-IP`
+- `X-Client-Port`
+- `X-Server-IP`
+- `X-Server-Port`
+- `X-Proto`
+
+It uses this network context when constructing emulated packets to be injected into Suricata.
+
+`icapsuricata` returns the inspection result via the `X-Response-Info` header. For example:
+
+```text
+X-Response-Info: blocked
 ```
-icap/
-├── srv_suricata.c   — c-icap service module source
-├── Makefile         — out-of-tree build (gcc, pkg-config, libsuricata-config)
-└── README.md        — this file
+
+It also expects icap clients to echo back the `X-Response-Vars` header it injects into its responses to clients. `icapsuricata` uses the values in `X-Response-Vars` internally, to initialize client and server sequence numbers when injecting emulated packets into Suricata in RESPMOD. (The `X-Response-Vars` header may be removed in the future.)
+
+```text
+X-Response-Vars: 3493600807,3338221217
 ```
 
----
+Currently, `icapsuricata` and the ICAP subsystem in `SSLproxy` support HTTP/1 only. But, the goal is to add support for other protocols, especially HTTP/2 and HTTP/3.
+
+### Dual-Reader Circular Buffer (Zero Heap Churn)
+To handle streaming payloads safely, the module manages memory via a high-performance, single-writer, dual-reader circular ring buffer. 
+* **The Writer:** Drains volatile incoming raw buffers from `c-icap` (`rbuf`) immediately to enforce TCP window backpressure and avoid network stalls.
+* **Reader 1 (Client Queue):** Safely drains data out to the outbound network socket block-by-block.
+* **Reader 2 (Suricata Queue):** Accumulates data independently into optimal chunk boundaries (typically 4KB alignment) before staging it for packetization.
+* **Space Reclamation:** Memory allocations are circular and strictly bound. Space is infinitely recycled the millisecond *both* readers have successfully advanced past a given index, completely eliminating runtime memory fragmentation (`realloc` loops).
+
+### Low-Overhead Network Emulation Pipeline
+Because `libsuricata` expects raw wire infrastructure, `icapsuricata` acts as a synthetic network tap. For every data transaction, it dynamically manufactures complete, valid, in-memory IPv4 and TCP frames containing appropriate hardware routing vectors, and TCP sequence space offsets.
+
+* **Handshake Generation:** Upon session initialization, the module simulates mock TCP handshakes to initialize Suricata’s internal flow engine.
+* **Secure Random ISN:** The module initializes sequence numbers securely using `/dev/urandom`.
+* **Sequential Stream Tracking:** As data steps through the ring buffer, payloads are wrapped into standard `PUSH|ACK` packets.
+* **State Finalization:** When the ICAP connection path flags an End-of-Data state (`iseof`), the module seamlessly injects sequentially correct `FIN|ACK` packet sweeps to cleanly close Suricata's internal state machine, forcing terminal application sweeps and releasing flow locks without hanging on idle timeouts.
+
+### Progressive Mid-Stream Flushing
+Instead of executing computationally heavy deep packet evaluation matrices on every micro-write, or conversely, waiting until the final connection close to discover an exploit, `icapsuricata` uses a balanced chunk flushing architecture. 
+
+Data is packetized and evaluation cycles are triggered dynamically as chunks clear the ring buffer (e.g., every 4KB). This forces Suricata’s `StreamTcp` engine to regularly reassemble and push its content windows up to the Application Layer (`AppLayer`), allowing signatures leveraging keywords like `http.response_body` to match fragments split across multiple injections and stop active threats mid-transit.
 
 ## Prerequisites
 
@@ -44,8 +88,6 @@ libsuricata-config --cflags
 libsuricata-config --libs
 ```
 
----
-
 ## Build
 
 ```bash
@@ -61,30 +103,43 @@ make CICAP_PREFIX=/opt/c-icap MODULES_DIR=/opt/c-icap/lib
 make install
 ```
 
----
-
-## c-icap server configuration
+## c-icap Server Configuration
 
 Add the following to your `c-icap.conf`:
 
-```
+```ini
 # Load the module
 Service suricata_service srv_suricata.so
 
-# Disallow 204 responses if not desired
-#suricata.Mode disallow204
+# Mode handling configuration
+# suricata.Mode disallow204
 ```
 
-And configure your ICAP client (e.g. SSLproxy) to forward requests to:
+### Protocol Modes
 
-```
+* **`allow204` Mode (Preview Continuation):** The module inspects early HTTP headers and the initialization block via the preview handler. If the evaluation is inconclusive but a body exists, the module returns an ICAP `100 Continue` status code, explicitly forcing the ICAP client to stream the remaining body segments into the `suri_io` pipeline for complete inspection.
+* **`disallow204` Mode:** Forces absolute structural encapsulation of the entire HTTP transmission stream.
+
+## Proxy Configuration
+
+Configure your upstream ICAP client (e.g. **SSLproxy**) to forward requests or responses to:
+
+```text
 icap://<host>:1344/suricata
 ```
----
 
-## Known limitations / next steps
+For example, you can use the following ICAP specification with SSLproxy:
 
-| Item | Status |
-|------|--------|
-| Body cap 256 KiB | Increase `SRV_SURICATA_MAX_BODY` or switch to streaming |
-| Synthetic packet framing | Raw bytes injected without real IP/TCP headers |
+```text
+Icap icap://127.0.0.1:1344,suricata,suricata,open,open,10,1024,0,yes,no,X-Response-Vars
+```
+See the [icap branch](https://github.com/sonertari/SSLproxy/tree/icap) in the SSLproxy project for details.
+
+## Licensing
+
+`icapsuricata` interfaces directly with `libsuricata` via software API linking inside the execution stack. Please be aware of the following structural requirements regarding distribution:
+
+* **c-icap** is licensed under the **LGPLv2.1**.
+* **Suricata** is licensed under the **GPLv2**.
+
+Because the GPL license model applies to combined works running within the same runtime process memory space, compilation or distribution of this module as a statically or dynamically linked runtime binary automatically qualifies the final artifact under **GPL** terms.
