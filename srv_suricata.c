@@ -79,7 +79,6 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#define SRV_SURICATA_MAX_BODY_BUF_SIZE (256 * 1024)  /* 256 KiB */
 #define SRV_SURICATA_INIT_BODY_BUF_SIZE (16 * 1024)  /* 16 KiB */
 #define SRV_SURICATA_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
 
@@ -96,13 +95,30 @@ enum conn_state {
     FIN
 };
 
+typedef struct {
+    char *buffer;
+    size_t capacity;       // Total size of the allocated ring array
+    size_t write_ptr;      // Where new data from c-icap goes
+    size_t read_client_ptr;// Tracking index for data sent to client
+    size_t read_suri_ptr;  // Tracking index for data injected to Suricata
+} dual_ring_buf_t;
+
+dual_ring_buf_t *dual_ring_buf_create(size_t capacity);
+void dual_ring_buf_destroy(dual_ring_buf_t *rb);
+void dual_ring_buf_clear(dual_ring_buf_t *rb);
+
+size_t dual_ring_buf_write_available(dual_ring_buf_t *rb);
+size_t dual_ring_buf_write(dual_ring_buf_t *rb, const char *src, size_t len);
+
+size_t dual_ring_buf_client_read_available(dual_ring_buf_t *rb);
+size_t dual_ring_buf_client_read(dual_ring_buf_t *rb, char *dst, size_t max_len);
+
+size_t dual_ring_buf_suri_read_available(dual_ring_buf_t *rb);
+size_t dual_ring_buf_suri_read(dual_ring_buf_t *rb, char *dst, size_t max_len);
+
 // Per-request data structure
 struct suri_req_ctx {
-    char    *body_buf;           /* flat accumulation buffer */
-    int      body_len;           /* bytes in body buffer so far */
-    int      body_cap;           /* allocated capacity */
-    int      body_sent;          /* bytes sent to client so far */
-    int      body_injected;      /* bytes injected to Suricata so far */
+    dual_ring_buf_t *body_buf;   /* accumulation buffer */
     int      preview_injected;   /* preview injected to Suricata */
     int      injected_since_ack; /* bytes injected to Suricata since last ACK */
 
@@ -541,8 +557,8 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     LiveDevicePktsIncr(GetLiveDevice(req));
 
     // Suricata owns the packet from here; do not free it ourselves yet
-    // We free pkt_buf in ReleasePacket
-    // free(pkt_buf);
+    // We free pkt in ReleasePacket
+    // free(pkt);
     return rv;
 }
 
@@ -674,10 +690,9 @@ void *suri_init_request_data(ci_request_t *req)
     }
 
     if (ci_req_hasbody(req)) {
-        ctx->body_cap = SRV_SURICATA_INIT_BODY_BUF_SIZE; /* grown in AppendToBodyBuf() */
-        ctx->body_buf = malloc(ctx->body_cap);
+        ctx->body_buf = dual_ring_buf_create(SRV_SURICATA_INIT_BODY_BUF_SIZE);
         if (!ctx->body_buf) {
-            ci_debug_printf(1, "srv_suricata: suri_init_request_data: malloc for body buf failed\n");
+            ci_debug_printf(1, "srv_suricata: suri_init_request_data: body buf init failed\n");
             free(ctx);
             return NULL;
         }
@@ -693,45 +708,16 @@ void suri_release_request_data(void *data)
     struct suri_req_ctx *ctx = (struct suri_req_ctx *)data;
     if (!ctx)
         return;
-    ci_debug_printf(5, "srv_suricata: suri_release_request_data: body_len=%d\n", ctx->body_len);
-    free(ctx->body_buf);
+
+    ci_debug_printf(5, "srv_suricata: suri_release_request_data: cap=%zu, client_len=%zu, suri_len=%zu\n",
+        ctx->body_buf ? ctx->body_buf->capacity : 0,
+        ctx->body_buf ? dual_ring_buf_client_read_available(ctx->body_buf) : 0,
+        ctx->body_buf ? dual_ring_buf_suri_read_available(ctx->body_buf) : 0);
+
+    if (ctx->body_buf) {
+        dual_ring_buf_destroy(ctx->body_buf);
+    }
     free(ctx);
-}
-
-static int AppendToBodyBuf(struct suri_req_ctx *ctx, const char *buf, int len)
-{
-    if (!buf || len <= 0)
-        return 0;
-
-    // Enforce the hard cap
-    if (ctx->body_len >= SRV_SURICATA_MAX_BODY_BUF_SIZE) {
-        ci_debug_printf(4, "srv_suricata: AppendToBodyBuf: body cap reached, dropping chunk\n");
-        return 0;
-    }
-    if (ctx->body_len + len > SRV_SURICATA_MAX_BODY_BUF_SIZE)
-        len = SRV_SURICATA_MAX_BODY_BUF_SIZE - ctx->body_len;
-
-    // Grow buffer if needed
-    if (ctx->body_len + len > ctx->body_cap) {
-        int new_cap = ctx->body_cap * 2;
-        while (new_cap < ctx->body_len + len)
-            new_cap *= 2;
-        if (new_cap > SRV_SURICATA_MAX_BODY_BUF_SIZE)
-            new_cap = SRV_SURICATA_MAX_BODY_BUF_SIZE;
-
-        char *tmp = realloc(ctx->body_buf, new_cap);
-        if (!tmp) {
-            ci_debug_printf(1, "srv_suricata: AppendToBodyBuf: realloc failed\n");
-            return -1;
-        }
-        ci_debug_printf(1, "srv_suricata: AppendToBodyBuf: realloc succeeded, new_cap=%d\n", new_cap);
-        ctx->body_buf = tmp;
-        ctx->body_cap = new_cap;
-    }
-
-    memcpy(ctx->body_buf + ctx->body_len, buf, len);
-    ctx->body_len += len;
-    return len;
 }
 
 int suri_get_response_vars(ci_request_t *req)
@@ -961,9 +947,8 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         ci_debug_printf(7, "srv_suricata: suri_check_preview_handler: Inject PUSH|ACK payload packet, payload_len=%zu, http_headers_len=%zu, preview_data_len=%d\n",
             payload_len, http_headers_len, preview_data_len);
 
-        ctx->body_injected = preview_data_len;
-        ctx->injected_since_ack = preview_data_len;
         ctx->preview_injected = preview_data_len;
+        ctx->injected_since_ack = preview_data_len;
 
         if ((rv = InjectPacket(req, payload, payload_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
             goto out;
@@ -998,9 +983,7 @@ out:
     }
 
     if (preview_data && preview_data_len > 0) {
-        // TODO: Use ring buffers as in c-icap examples?
-        // ci_ring_buf_write(data->body, preview_data, preview_data_len);
-        AppendToBodyBuf(ctx, preview_data, preview_data_len);
+        dual_ring_buf_write(ctx->body_buf, preview_data, preview_data_len);
     }
 
     return CI_MOD_CONTINUE;
@@ -1010,21 +993,19 @@ int suri_end_of_data_handler(ci_request_t *req)
 {
     struct suri_req_ctx *ctx = ci_service_data(req);
 
-    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", ctx->body_len, ctx->block, ctx->error, ctx->eof);
+    int inject_len = ctx->body_buf ? dual_ring_buf_suri_read_available(ctx->body_buf) : 0;
+    ci_debug_printf(5, "srv_suricata: suri_end_of_data: ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", inject_len, ctx->block, ctx->error, ctx->eof);
 
     // Set to -2 to distinguish uninitialized state
     int rv = -2;
 
     // Only inject if we haven't already done so in the preview handler or io callback
-    if (!ctx->block && !ctx->error && !ctx->eof && ctx->body_len > 0 && ctx->body_injected < ctx->body_len) {
-        int inject_len = ctx->body_len - ctx->body_injected;
-        int buf_offset = ctx->body_injected;
+    if (!ctx->block && !ctx->error && !ctx->eof && inject_len > 0) {
+        ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata\n", inject_len);
+        char inject_buf[inject_len];
+        inject_len = dual_ring_buf_suri_read(ctx->body_buf, inject_buf, inject_len);
 
-        ctx->body_injected += inject_len;
-        // ctx->inject_len_since_ack += inject_len;
-
-        ci_debug_printf(5, "srv_suricata: suri_end_of_data: Injecting %d bytes into Suricata, buf_offset=%d\n", inject_len, buf_offset);
-        if ((rv = InjectPacket(req, ctx->body_buf + buf_offset, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+        if ((rv = InjectPacket(req, inject_buf, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
             goto out;
         }
     }
@@ -1073,35 +1054,40 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
 
     if (wbuf && wlen && *wlen > 0) {
         int wbuf_size = *wlen;
-        int body_buf_copy_len = 0;
+        int body_buf_copy_len = dual_ring_buf_client_read_available(ctx->body_buf);
 
-        if (ctx->body_sent < ctx->body_len) {
-            body_buf_copy_len = (ctx->body_len - ctx->body_sent < wbuf_size) ? ctx->body_len - ctx->body_sent : wbuf_size;
+        if (body_buf_copy_len > 0) {
+            body_buf_copy_len = body_buf_copy_len < wbuf_size ? body_buf_copy_len : wbuf_size;
 
             ci_debug_printf(5, "srv_suricata: suri_io: Send %d bytes from body_buf to client\n", body_buf_copy_len);
-            memcpy(wbuf, ctx->body_buf + ctx->body_sent, body_buf_copy_len);
+            body_buf_copy_len = dual_ring_buf_client_read(ctx->body_buf, wbuf, body_buf_copy_len);
 
-            ctx->body_sent += body_buf_copy_len;
+            wbuf_size -= body_buf_copy_len;
         }
 
         // This sets *wlen to 0 if we have no data to send, so we can set *wlen to CI_EOF below if iseof
         *wlen = body_buf_copy_len;
 
-        if (rbuf && rlen && *rlen > 0 && *wlen < wbuf_size) {
-            rbuf_copy_len = (*rlen < wbuf_size - *wlen) ? *rlen : wbuf_size - *wlen;
+        if (rbuf && rlen && rbuf_size > 0 && wbuf_size > 0) {
+            rbuf_copy_len = (rbuf_size < wbuf_size) ? rbuf_size : wbuf_size;
 
             ci_debug_printf(5, "srv_suricata: suri_io: Send %d bytes from rbuf to client\n", rbuf_copy_len);
             memcpy(wbuf + *wlen, rbuf, rbuf_copy_len);
 
             *wlen += rbuf_copy_len;
             *rlen = rbuf_copy_len;
-
-            ctx->body_sent += rbuf_copy_len;
+            rbuf_size -= rbuf_copy_len;
         }
 
-        int inject_len = body_buf_copy_len + rbuf_copy_len;
+        int suri_avail = dual_ring_buf_suri_read_available(ctx->body_buf);
+        int inject_len = suri_avail + rbuf_copy_len;
 
-        if (inject_len > 0 && ctx->body_injected < ctx->body_len) {
+        ci_debug_printf(5, "srv_suricata: suri_io: Current body_buf_copy_len=%d, rbuf_copy_len=%d, suri avail=%d\n", body_buf_copy_len, rbuf_copy_len, suri_avail);
+
+        if (inject_len > 0) {
+            // Advance the suri read pointer, no memcpy
+            dual_ring_buf_suri_read(ctx->body_buf, NULL, suri_avail);
+
             int wbuf_offset = 0;
             if (ctx->preview_injected > 0) {
                 inject_len -= ctx->preview_injected;
@@ -1109,7 +1095,6 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
                 ctx->preview_injected = 0;  // Reset the counter as we have accounted for the preview buffer in this injection
             }
 
-            ctx->body_injected += inject_len;
             ctx->injected_since_ack += inject_len;
 
             ci_debug_printf(5, "srv_suricata: suri_io: Injecting %d bytes into Suricata, wbuf_offset=%d\n", inject_len, wbuf_offset);
@@ -1122,9 +1107,13 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         ci_debug_printf(5, "srv_suricata: suri_io: Current wlen=%d, rlen=%d\n", *wlen, rlen ? *rlen : 0);
     }
 
-    if (rbuf && rlen && *rlen > 0) {
-        ci_debug_printf(5, "srv_suricata: suri_io: Buffer new data not sent, rlen=%d\n", *rlen);
-        AppendToBodyBuf(ctx, rbuf + rbuf_copy_len, rbuf_size - rbuf_copy_len);
+    if (rbuf && rlen && rbuf_size > 0) {
+        ci_debug_printf(5, "srv_suricata: suri_io: Buffer new data not sent, rbuf_size=%d\n", rbuf_size);
+        int written = dual_ring_buf_write(ctx->body_buf, rbuf + rbuf_copy_len, rbuf_size);
+        if (written < rbuf_size) {
+            ci_debug_printf(1, "srv_suricata: suri_io: Failed to write to body_buf, written=%d < rbuf_size=%d\n", written, rbuf_size);
+        }
+        *rlen = rbuf_copy_len + written;  // Tell c-icap that we consumed some of the rbuf data
     }
 
     if (wlen && *wlen == 0 && (ctx->eof == 1 || iseof)) {
@@ -1173,4 +1162,112 @@ int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
         return 0;
     }
     return 1;
+}
+
+/* ================= Ring buffer with dual readers ================= */
+
+dual_ring_buf_t *dual_ring_buf_create(size_t capacity) {
+    // Add +1 byte because a traditional circular buffer keeps one slot empty
+    // to cleanly differentiate between an empty buffer and a full buffer.
+    dual_ring_buf_t *rb = malloc(sizeof(dual_ring_buf_t));
+    if (!rb) return NULL;
+    
+    rb->capacity = capacity + 1;
+    rb->buffer = malloc(rb->capacity);
+    if (!rb->buffer) {
+        free(rb);
+        return NULL;
+    }
+    dual_ring_buf_clear(rb);
+    return rb;
+}
+
+void dual_ring_buf_destroy(dual_ring_buf_t *rb) {
+    if (rb) {
+        free(rb->buffer);
+        free(rb);
+    }
+}
+
+void dual_ring_buf_clear(dual_ring_buf_t *rb) {
+    rb->write_ptr = 0;
+    rb->read_client_ptr = 0;
+    rb->read_suri_ptr = 0;
+}
+
+// Space reclamation is strictly dictated by whichever reader is lagging furthest behind.
+size_t dual_ring_buf_write_available(dual_ring_buf_t *rb) {
+    size_t trailing_edge = MIN(rb->read_client_ptr, rb->read_suri_ptr);
+    if (rb->write_ptr >= trailing_edge) {
+        return rb->capacity - (rb->write_ptr - trailing_edge) - 1;
+    }
+    return trailing_edge - rb->write_ptr - 1;
+}
+
+size_t dual_ring_buf_write(dual_ring_buf_t *rb, const char *src, size_t len) {
+    size_t avail = dual_ring_buf_write_available(rb);
+    if (len > avail) len = avail; // Clip to what safely fits
+    if (len == 0) return 0;
+
+    // Linear space from write pointer to physical end of the array
+    size_t first_chunk = MIN(len, rb->capacity - rb->write_ptr);
+    memcpy(rb->buffer + rb->write_ptr, src, first_chunk);
+    
+    // Remaining chunk wraps around to index 0
+    if (len > first_chunk) {
+        memcpy(rb->buffer, src + first_chunk, len - first_chunk);
+    }
+
+    rb->write_ptr = (rb->write_ptr + len) % rb->capacity;
+    return len;
+}
+
+/* ==================== CLIENT READER INTERFACE ==================== */
+
+size_t dual_ring_buf_client_read_available(dual_ring_buf_t *rb) {
+    if (rb->write_ptr >= rb->read_client_ptr) {
+        return rb->write_ptr - rb->read_client_ptr;
+    }
+    return rb->capacity - (rb->read_client_ptr - rb->write_ptr);
+}
+
+size_t dual_ring_buf_client_read(dual_ring_buf_t *rb, char *dst, size_t max_len) {
+    size_t avail = dual_ring_buf_client_read_available(rb);
+    if (max_len > avail) max_len = avail;
+    if (max_len == 0) return 0;
+
+    size_t first_chunk = MIN(max_len, rb->capacity - rb->read_client_ptr);
+    if (dst) memcpy(dst, rb->buffer + rb->read_client_ptr, first_chunk);
+
+    if (max_len > first_chunk) {
+        if (dst) memcpy(dst + first_chunk, rb->buffer, max_len - first_chunk);
+    }
+
+    rb->read_client_ptr = (rb->read_client_ptr + max_len) % rb->capacity;
+    return max_len;
+}
+
+/* ==================== SURICATA READER INTERFACE ==================== */
+
+size_t dual_ring_buf_suri_read_available(dual_ring_buf_t *rb) {
+    if (rb->write_ptr >= rb->read_suri_ptr) {
+        return rb->write_ptr - rb->read_suri_ptr;
+    }
+    return rb->capacity - (rb->read_suri_ptr - rb->write_ptr);
+}
+
+size_t dual_ring_buf_suri_read(dual_ring_buf_t *rb, char *dst, size_t max_len) {
+    size_t avail = dual_ring_buf_suri_read_available(rb);
+    if (max_len > avail) max_len = avail;
+    if (max_len == 0) return 0;
+
+    size_t first_chunk = MIN(max_len, rb->capacity - rb->read_suri_ptr);
+    if (dst) memcpy(dst, rb->buffer + rb->read_suri_ptr, first_chunk);
+
+    if (max_len > first_chunk) {
+        if (dst) memcpy(dst + first_chunk, rb->buffer, max_len - first_chunk);
+    }
+
+    rb->read_suri_ptr = (rb->read_suri_ptr + max_len) % rb->capacity;
+    return max_len;
 }
