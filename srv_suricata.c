@@ -73,6 +73,21 @@
 #include <suricata/runmode-lib.h>
 #include <suricata/action-globals.h>
 
+// These headers are defined in suricata/stream-tcp-private.h, and they conflict with netinet/tcp.h
+// Temporarily rename the conflicting symbols to protect them from netinet/tcp.h
+#define TCP_SYN_SENT    SURI_TCP_SYN_SENT
+#define TCP_SYN_RECV    SURI_TCP_SYN_RECV
+#define TCP_ESTABLISHED SURI_TCP_ESTABLISHED
+#define TCP_FIN_WAIT1   SURI_TCP_FIN_WAIT1
+#define TCP_FIN_WAIT2   SURI_TCP_FIN_WAIT2
+#define TCP_TIME_WAIT   SURI_TCP_TIME_WAIT
+#define TCP_LAST_ACK    SURI_TCP_LAST_ACK
+#define TCP_CLOSE_WAIT  SURI_TCP_CLOSE_WAIT
+#define TCP_CLOSING     SURI_TCP_CLOSING
+#define TCP_CLOSED      SURI_TCP_CLOSED
+
+#include <suricata/stream-tcp.h>
+
 // For synthetic buffer construction
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -119,9 +134,9 @@ size_t dual_ring_buf_suri_read(dual_ring_buf_t *rb, char *dst, size_t max_len);
 
 // Per-request data structure
 struct suri_req_ctx {
-    dual_ring_buf_t *body_buf;   /* accumulation buffer */
-    int      preview_injected;   /* preview injected to Suricata */
-    int      injected_since_ack; /* bytes injected to Suricata since last ACK */
+    dual_ring_buf_t *body_buf;       /* accumulation buffer */
+    unsigned int preview_injected;   /* preview injected to Suricata */
+    unsigned int injected_since_ack; /* bytes injected to Suricata since last ACK */
 
     unsigned int eof : 1;
     unsigned int block : 1;
@@ -153,9 +168,15 @@ struct suri_req_ctx {
 enum suri_mode {mode_disallow204, mode_allow204};
 static int MODE = mode_allow204;
 
+// The c-icap wbuf size is usually 4064 bytes, so pick a threshold slightly below that
+// Setting ACKWINDOW to 0 disables ACK injection
+static unsigned int ACKWINDOW = 4000;  /* bytes */
+
 static int  suri_cfg_mode(const char *directive, const char **argv, void *setdata);
+static int  suri_cfg_ackwindow(const char *directive, const char **argv, void *setdata);
 static struct ci_conf_entry suri_conf_variables[] = {
-    {"Mode", NULL, suri_cfg_mode, NULL}
+    {"Mode", NULL, suri_cfg_mode, NULL},
+    {"ACKwindow", NULL, suri_cfg_ackwindow, NULL},
 };
 
 int  suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf);
@@ -949,21 +970,24 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
             payload_len, http_headers_len, preview_data_len);
 
         ctx->preview_injected = preview_data_len;
-        ctx->injected_since_ack = preview_data_len;
 
         if ((rv = InjectPacket(req, payload, payload_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
             goto out;
         }
 
-        // ATTENTION: Suricata does not detect unless we also inject these final ACK packets to flush the flow
-        suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
-        if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 0 : 1)) != 0) {
-            goto out;
-        }
+        if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+            ctx->injected_since_ack = preview_data_len;
 
-        suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "server" : "client");
-        if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-            goto out;
+            // ATTENTION: In IDS mode Suricata does not detect unless we also inject these final ACK packets to flush the flow
+            suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
+            if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 0 : 1)) != 0) {
+                goto out;
+            }
+
+            suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "server" : "client");
+            if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+                goto out;
+            }
         }
     }
 out:
@@ -1096,7 +1120,9 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
                 ctx->preview_injected = 0;  // Reset the counter as we have accounted for the preview buffer in this injection
             }
 
-            ctx->injected_since_ack += inject_len;
+            if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+                ctx->injected_since_ack += inject_len;
+            }
 
             suri_log(5, "Injecting %d bytes into Suricata, wbuf_offset=%d\n", inject_len, wbuf_offset);
             if ((rv = InjectPacket(req, wbuf + wbuf_offset, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
@@ -1122,28 +1148,27 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         *wlen = CI_EOF;
     }
 
-    // The c-icap wbuf size is usually 4064 bytes, so pick a threshold slightly below that
-    #define ACK_WINDOW_SIZE 4000
+    if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+        // This io function may be called after end_of_data_handler and when we set CI_EOF above,
+        // so do not inject duplicate ACK packets, hence !data->sent_fin and data->injected_since_ack > 0
+        if ((ctx->injected_since_ack >= ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && !ctx->sent_fin) {
+            suri_log(7, "Reached ACK window size or iseof, injecting ACK packets, injected_since_ack=%u, ACKWINDOW=%u, iseof=%d, sent_fin=%d\n",
+                ctx->injected_since_ack, ACKWINDOW, iseof, ctx->sent_fin);
 
-    // This io function may be called after end_of_data_handler and when we set CI_EOF above,
-    // so do not inject duplicate ACK packets, hence !data->sent_fin and data->sent_len_since_ack > 0
-    if ((ctx->injected_since_ack >= ACK_WINDOW_SIZE || (iseof && ctx->injected_since_ack > 0)) && !ctx->sent_fin) {
-        suri_log(7, "Reached ACK window size or iseof, injecting ACK packets, sent_len_since_ack=%d, iseof=%d, sent_fin=%d\n",
-            ctx->injected_since_ack, iseof, ctx->sent_fin);
+            ctx->injected_since_ack = 0;
 
-        ctx->injected_since_ack = 0;
+            // ATTENTION: In IDS mode Suricata does not detect unless we also inject these final ACK packets to flush the flow
+            suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
+            if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 0 : 1)) != 0) {
+                *wlen = 0;  // Tell c-icap not to send wbuf to the client
+                goto out;
+            }
 
-        // ATTENTION: Suricata does not detect unless we also inject these final ACK packets to flush the flow
-        suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "client" : "server");
-        if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 0 : 1)) != 0) {
-            *wlen = 0;  // Tell c-icap not to send wbuf to the client
-            goto out;
-        }
-
-        suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "server" : "client");
-        if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-            *wlen = 0;  // Tell c-icap not to send wbuf to the client
-            goto out;
+            suri_log(7, "Inject ACK packet to %s for flushing\n", req->type == ICAP_REQMOD ? "server" : "client");
+            if ((rv = InjectPacket(req, NULL, 0, TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+                *wlen = 0;  // Tell c-icap not to send wbuf to the client
+                goto out;
+            }
         }
     }
 out:
@@ -1162,6 +1187,32 @@ int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
         suri_log(1, "Unknown value '%s' for configuration parameter '%s'\n", argv[0], directive);
         return 0;
     }
+    suri_log(2, "Setting parameter: %s\n", directive);
+    return 1;
+}
+
+int suri_cfg_ackwindow(const char *directive, const char **argv, void *setdata)
+{
+    if (argv == NULL || argv[0] == NULL) {
+        suri_log(1, "Missing arguments in directive %s \n", directive);
+        return 0;
+    }
+
+    errno = 0;
+    char *endptr;
+    unsigned long size = strtoul(argv[0], &endptr, 10);
+    if (errno != 0 || endptr == argv[0] || *endptr != '\0' || size > 65535) {
+        suri_log(1, "Invalid argument in directive %s \n", directive);
+        return 0;
+    }
+
+    if (StreamTcpInlineMode() && size > 0) {
+        suri_log(1, "ACKwindow enabled in TCP stream inline mode\n");
+        return 0;
+    }
+
+    suri_log(2, "Setting parameter: %s=%lu\n", directive, size);
+    ACKWINDOW = size;
     return 1;
 }
 
