@@ -94,17 +94,18 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#define SRV_SURICATA_INIT_BODY_BUF_SIZE (64 * 1024)  /* 64 KiB */
-#define SRV_SURICATA_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
+#define SURI_BODY_BUF_SIZE (64 * 1024)  /* 64 KiB */
+#define SURI_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
 
-#define suri_log(LEVEL, format_str, ...) ci_debug_printf(LEVEL, "srv_suricata: %s: " format_str, __FUNCTION__, ##__VA_ARGS__)
+#define suri_log(LEVEL, format_str, ...) \
+    ci_debug_printf(LEVEL, "srv_suricata: %s: " format_str, __FUNCTION__, ##__VA_ARGS__)
 
 static ThreadVars *g_worker_tv  = NULL;
 static pthread_t   g_worker_tid = 0;
 static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
 static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
-enum conn_state {
+enum suri_conn_state {
     SYN = 0,
     SYN_ACK,
     ACK,
@@ -114,10 +115,10 @@ enum conn_state {
 
 typedef struct {
     char *buffer;
-    size_t capacity;       // Total size of the allocated ring array
-    size_t write_ptr;      // Where new data from c-icap goes
-    size_t read_client_ptr;// Tracking index for data sent to client
-    size_t read_suri_ptr;  // Tracking index for data injected to Suricata
+    size_t capacity;        // Total size of the allocated ring array
+    size_t write_ptr;       // Where new data from c-icap goes
+    size_t read_client_ptr; // Tracking index for data sent to client
+    size_t read_suri_ptr;   // Tracking index for data injected to Suricata
 } dual_ring_buf_t;
 
 dual_ring_buf_t *dual_ring_buf_create(size_t capacity);
@@ -134,7 +135,7 @@ size_t dual_ring_buf_suri_read_available(dual_ring_buf_t *rb);
 size_t dual_ring_buf_suri_read(dual_ring_buf_t *rb, char *dst, size_t max_len);
 
 // Per-request data structure
-struct suri_req_ctx {
+struct suri_ctx {
     dual_ring_buf_t *body_buf;       /* accumulation buffer */
     unsigned int preview_injected;   /* preview injected to Suricata */
     unsigned int injected_since_ack; /* bytes injected to Suricata since last ACK */
@@ -160,7 +161,7 @@ struct suri_req_ctx {
     uint32_t client_ack;
     uint32_t server_seq;
     uint32_t server_ack;
-    enum conn_state state;
+    enum suri_conn_state state;
 
     // __suseconds_t tv_usec;
 };
@@ -172,10 +173,10 @@ static int SURI_MODE = mode_allow204;
 // Setting ACKWINDOW to 0 disables ACK injection
 static unsigned int SURI_ACKWINDOW = 4000;  /* bytes */
 
-static unsigned int SURI_PREVIEW = SRV_SURICATA_INIT_BODY_BUF_SIZE;  /* bytes */
+static unsigned int SURI_PREVIEW = SURI_BODY_BUF_SIZE;  /* bytes */
 
 // SURI_BUFSIZE should be larger than or equal to SURI_PREVIEW, otherwise we cannot buffer preview data
-static unsigned int SURI_BUFSIZE = SRV_SURICATA_INIT_BODY_BUF_SIZE;  /* bytes */
+static unsigned int SURI_BUFSIZE = SURI_BODY_BUF_SIZE;  /* bytes */
 
 static int  suri_cfg_mode(const char *directive, const char **argv, void *setdata);
 static int  suri_cfg_ackwindow(const char *directive, const char **argv, void *setdata);
@@ -303,7 +304,7 @@ struct __attribute__((__packed__)) fake_pkt_hdr {
 
 static uint32_t GetClientIP(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
 
     if (!ctx->client_ip_set) {
@@ -321,7 +322,7 @@ static uint32_t GetClientIP(ci_request_t *req)
 
 static uint32_t GetClientPort(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
 
     if (!ctx->client_port_set) {
@@ -339,7 +340,7 @@ static uint32_t GetClientPort(ci_request_t *req)
 
 static uint32_t GetServerIP(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
 
     if (!ctx->server_ip_set) {
@@ -357,7 +358,7 @@ static uint32_t GetServerIP(ci_request_t *req)
 
 static uint32_t GetServerPort(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
 
     if (!ctx->server_port_set) {
@@ -375,7 +376,7 @@ static uint32_t GetServerPort(ci_request_t *req)
 
 static uint8_t GetProto(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
 
     if (!ctx->proto_set) {
@@ -393,7 +394,7 @@ static uint8_t GetProto(ci_request_t *req)
 
 static LiveDevice *GetLiveDevice(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     if (!ctx->dev_set) {
         ctx->dev_set = 1;
@@ -412,7 +413,7 @@ static LiveDevice *GetLiveDevice(ci_request_t *req)
 
 static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     // ISNs are assigned in preview handler
     if (ctx->state == SYN) {
@@ -454,7 +455,7 @@ static void GetSeqAck(ci_request_t *req, size_t len, int toserver)
 // Create emulated packet
 static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, uint16_t flags, int toserver, size_t *pkt_len)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     size_t header_len = sizeof(struct fake_pkt_hdr);
     *pkt_len = header_len + data_len;
@@ -597,7 +598,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     return rv;
 }
 
-void suri_cfg_set(ci_service_xdata_t *srv_xdata)
+static void suri_cfg_set(ci_service_xdata_t *srv_xdata)
 {
     if (SURI_BUFSIZE < SURI_PREVIEW) {
         suri_log(1, "Buffer size must be larger than or equal to preview size, exiting, bufsize=%u, preview=%u\n", SURI_BUFSIZE, SURI_PREVIEW);
@@ -747,7 +748,7 @@ void *suri_init_request_data(ci_request_t *req)
 {
     suri_log(1, "ENTER\n");
 
-    struct suri_req_ctx *ctx = calloc(1, sizeof(*ctx));
+    struct suri_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
         suri_log(1, "calloc failed for request data\n");
         return NULL;
@@ -769,7 +770,7 @@ void suri_release_request_data(void *data)
 {
     suri_log(5, "ENTER\n");
 
-    struct suri_req_ctx *ctx = (struct suri_req_ctx *)data;
+    struct suri_ctx *ctx = (struct suri_ctx *)data;
     if (!ctx)
         return;
 
@@ -786,7 +787,7 @@ void suri_release_request_data(void *data)
 
 int suri_get_response_vars(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     const char *vars = ci_icap_request_get_header(req, "X-Response-Vars");
     if (vars == NULL) {
@@ -833,7 +834,7 @@ int suri_get_response_vars(ci_request_t *req)
     return rv;
 }
 
-void suri_init_tcp_session(struct suri_req_ctx *ctx)
+void suri_init_tcp_session(struct suri_ctx *ctx)
 {
     // Open the kernel's secure random device
     // O_CLOEXEC is a good habit to prevent descriptor leaks with fork+exec, even though we don't exec here.
@@ -852,7 +853,7 @@ void suri_init_tcp_session(struct suri_req_ctx *ctx)
 
     if (bytes_read != (ssize_t)total_bytes) {
         suri_log(1, "Failed to read enough bytes from /dev/urandom\n");
-        goto err; // Failed to read enough bytes
+        goto err;
     }
 
     // Assign the secure random numbers
@@ -871,7 +872,7 @@ out:
 
 int suri_set_seq_numbers(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     if (req->type == ICAP_REQMOD) {
         suri_init_tcp_session(ctx);
@@ -900,7 +901,7 @@ int suri_set_seq_numbers(ci_request_t *req)
 
 int suri_handle_inspect_result(ci_request_t *req, int rv)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     switch (rv) {
     case 1:
@@ -935,7 +936,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 {
     ci_off_t content_len;
 
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     content_len = ci_http_content_length(req);
     suri_log(9, "We expect to read :%" PRINTF_OFF_T " body data\n", (CAST_OFF_T) content_len);
@@ -982,7 +983,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     }
 
     size_t http_headers_len = 0;
-    char http_headers[SRV_SURICATA_MAX_HTTP_HDRS];
+    char http_headers[SURI_MAX_HTTP_HDRS];
 
     ci_headers_list_t *http_headers_list = req->type == ICAP_REQMOD ? ci_http_request_headers(req) : ci_http_response_headers(req);
     if (http_headers_list) {
@@ -1062,7 +1063,7 @@ out:
 
 int suri_end_of_data_handler(ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     int inject_len = ctx->body_buf ? dual_ring_buf_suri_read_available(ctx->body_buf) : 0;
     suri_log(5, "ENTER, body_len=%d, block=%d, error=%d, eof=%d\n", inject_len, ctx->block, ctx->error, ctx->eof);
@@ -1102,7 +1103,7 @@ out:
 
 int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_t *req)
 {
-    struct suri_req_ctx *ctx = ci_service_data(req);
+    struct suri_ctx *ctx = ci_service_data(req);
 
     suri_log(5, "ENTER rbuf=%p, wbuf=%p, rlen=%p, wlen=%p, *rlen=%d, *wlen=%d, iseof=%d, req=%p\n",
         rbuf, wbuf, rlen, wlen, rlen ? *rlen : 0, wlen ? *wlen : 0, iseof, req);
