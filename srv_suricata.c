@@ -73,6 +73,7 @@
 #include <suricata/runmode-lib.h>
 #include <suricata/action-globals.h>
 
+// TODO: Remove after Suricata headers are refactored to not conflict with netinet/tcp.h
 // These headers are defined in suricata/stream-tcp-private.h, and they conflict with netinet/tcp.h
 // Temporarily rename the conflicting symbols to protect them from netinet/tcp.h
 #define TCP_SYN_SENT    SURI_TCP_SYN_SENT
@@ -141,7 +142,6 @@ struct suri_req_ctx {
     unsigned int eof : 1;
     unsigned int block : 1;
     unsigned int error : 1;
-    unsigned int sent_fin : 1;
 
     uint32_t client_ip;
     unsigned int client_ip_set : 1;
@@ -1036,10 +1036,9 @@ int suri_end_of_data_handler(ci_request_t *req)
     }
 
     // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
-    if ((req->type != ICAP_REQMOD || ctx->error) && !ctx->block && !ctx->sent_fin) {
-        ctx->sent_fin = 1;
-
+    if ((req->type != ICAP_REQMOD || ctx->error) && !ctx->block && ctx->state != FIN) {
         ctx->state = FIN;
+
         suri_log(7, "Inject FIN|ACK packet to server\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_FIN|TH_ACK, 1)) != 0) {
             goto out;
@@ -1150,10 +1149,10 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
 
     if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
         // This io function may be called after end_of_data_handler and when we set CI_EOF above,
-        // so do not inject duplicate ACK packets, hence !data->sent_fin and data->injected_since_ack > 0
-        if ((ctx->injected_since_ack >= ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && !ctx->sent_fin) {
-            suri_log(7, "Reached ACK window size or iseof, injecting ACK packets, injected_since_ack=%u, ACKWINDOW=%u, iseof=%d, sent_fin=%d\n",
-                ctx->injected_since_ack, ACKWINDOW, iseof, ctx->sent_fin);
+        // so do not inject duplicate ACK packets, hence ctx->state != FIN and ctx->injected_since_ack > 0
+        if ((ctx->injected_since_ack >= ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && ctx->state != FIN) {
+            suri_log(7, "Reached ACK window size or iseof, injecting ACK packets, injected_since_ack=%u, ACKWINDOW=%u, iseof=%d, state=%d\n",
+                ctx->injected_since_ack, ACKWINDOW, iseof, ctx->state);
 
             ctx->injected_since_ack = 0;
 
