@@ -1208,8 +1208,12 @@ out:
 
 static int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
 {
-    if (strcasecmp(argv[0], "disallow204") == 0)
+    if (strcasecmp(argv[0], "allow204") == 0) {
+        SURI_MODE = mode_allow204;
+    }
+    else if (strcasecmp(argv[0], "disallow204") == 0) {
         SURI_MODE = mode_disallow204;
+    }
     else {
         suri_log(1, "Unknown value '%s' for configuration parameter '%s'\n", argv[0], directive);
         return 0;
