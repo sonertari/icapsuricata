@@ -94,7 +94,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 
-#define SRV_SURICATA_INIT_BODY_BUF_SIZE (16 * 1024)  /* 16 KiB */
+#define SRV_SURICATA_INIT_BODY_BUF_SIZE (64 * 1024)  /* 64 KiB */
 #define SRV_SURICATA_MAX_HTTP_HDRS (16 * 1024)  /* 16 KiB */
 
 #define suri_log(LEVEL, format_str, ...) ci_debug_printf(LEVEL, "srv_suricata: %s: " format_str, __FUNCTION__, ##__VA_ARGS__)
@@ -166,20 +166,33 @@ struct suri_req_ctx {
 };
 
 enum suri_mode {mode_disallow204, mode_allow204};
-static int MODE = mode_allow204;
+static int SURI_MODE = mode_allow204;
 
 // The c-icap wbuf size is usually 4064 bytes, so pick a threshold slightly below that
 // Setting ACKWINDOW to 0 disables ACK injection
-static unsigned int ACKWINDOW = 4000;  /* bytes */
+static unsigned int SURI_ACKWINDOW = 4000;  /* bytes */
+
+static unsigned int SURI_PREVIEW = SRV_SURICATA_INIT_BODY_BUF_SIZE;  /* bytes */
+
+// SURI_BUFSIZE should be larger than or equal to SURI_PREVIEW, otherwise we cannot buffer preview data
+static unsigned int SURI_BUFSIZE = SRV_SURICATA_INIT_BODY_BUF_SIZE;  /* bytes */
 
 static int  suri_cfg_mode(const char *directive, const char **argv, void *setdata);
 static int  suri_cfg_ackwindow(const char *directive, const char **argv, void *setdata);
+static int  suri_cfg_preview(const char *directive, const char **argv, void *setdata);
+static int  suri_cfg_bufsize(const char *directive, const char **argv, void *setdata);
+
 static struct ci_conf_entry suri_conf_variables[] = {
     {"Mode", NULL, suri_cfg_mode, NULL},
     {"ACKwindow", NULL, suri_cfg_ackwindow, NULL},
+    // PreviewSize is a standard c-icap directive, but we re-define it here to enforce the bufsize >= preview constraint
+    {"Preview", NULL, suri_cfg_preview, NULL},
+    {"BufSize", NULL, suri_cfg_bufsize, NULL},
+    {NULL, NULL, NULL, NULL}
 };
 
 int  suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf);
+int  suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf *server_conf);
 void suri_close_service(void);
 void *suri_init_request_data(ci_request_t *req);
 void suri_release_request_data(void *data);
@@ -192,7 +205,7 @@ static ci_service_module_t suricata_service = {
     "Suricata ICAP service",            /* mod_short_descr           */
     ICAP_RESPMOD | ICAP_REQMOD,         /* mod_type                  */
     suri_init_service,                  /* mod_init_service          */
-    NULL,                               /* post_init_service         */
+    suri_post_init_service,             /* post_init_service         */
     suri_close_service,                 /* mod_close_service         */
     suri_init_request_data,             /* mod_init_request_data     */
     suri_release_request_data,          /* mod_release_request_data  */
@@ -584,6 +597,35 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     return rv;
 }
 
+void suri_cfg_set(ci_service_xdata_t *srv_xdata)
+{
+    if (SURI_BUFSIZE < SURI_PREVIEW) {
+        suri_log(1, "Buffer size must be larger than or equal to preview size, exiting, bufsize=%u, preview=%u\n", SURI_BUFSIZE, SURI_PREVIEW);
+        // c-icap does not exit if we return CI_ERROR from the init functions, so we must force exit here to prevent running with invalid config
+        // Force c-icap's internal log buffers to dump to disk immediately
+        fflush(NULL);
+        exit(EXIT_FAILURE);
+    }
+
+    suri_log(7, "Set preview size, preview=%u <= bufsize=%u\n", SURI_PREVIEW, SURI_BUFSIZE);
+    ci_service_set_preview(srv_xdata, SURI_PREVIEW);
+
+    // Ask clients to send preview for all content types
+    ci_service_set_transfer_preview(srv_xdata, "*");
+
+    if (SURI_MODE == mode_allow204) {
+        suri_log(7, "Enable 204 mode\n");
+        ci_service_enable_204(srv_xdata);
+    }
+    else {
+        suri_log(7, "Disable 204 mode\n");
+        // c-icap does not provide a public API to clear the 204 feature flag, so we must do it manually here
+        ci_thread_rwlock_wrlock(&srv_xdata->lock);
+        srv_xdata->allow_204 = 0;
+        ci_thread_rwlock_unlock(&srv_xdata->lock);
+    }
+}
+
 // Called once when the module is loaded
 int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf)
 {
@@ -650,18 +692,18 @@ int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *serv
     // so we can conditionally bypass shutdown in child processes.
     g_parent_pid = getpid();
 
-    ci_service_set_preview(srv_xdata, 4096);
-
-    if (MODE == mode_allow204) {
-        ci_service_enable_204(srv_xdata);
-    }
-
-    // Ask clients to send preview for all content types
-    ci_service_set_transfer_preview(srv_xdata, "*");
+    suri_cfg_set(srv_xdata);
 
     suri_log(5, "Suricata engine ready\n");
     g_suri_ready = 1;
 
+    return CI_OK;
+}
+
+int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf *server_conf)
+{
+    // Set config again, with possibly updated values
+    suri_cfg_set(srv_xdata);
     return CI_OK;
 }
 
@@ -712,7 +754,7 @@ void *suri_init_request_data(ci_request_t *req)
     }
 
     if (ci_req_hasbody(req)) {
-        ctx->body_buf = dual_ring_buf_create(SRV_SURICATA_INIT_BODY_BUF_SIZE);
+        ctx->body_buf = dual_ring_buf_create(SURI_BUFSIZE);
         if (!ctx->body_buf) {
             suri_log(1, "body_buf init failed\n");
             free(ctx);
@@ -900,17 +942,21 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 
     ci_req_unlock_data(req);
 
-    if (preview_data_len == 0) {
+    // Set to -2 to distinguish uninitialized state
+    int rv = -2;
+
+    if (preview_data_len > (int)SURI_PREVIEW) {
+        suri_log(1, "Preview data len larger than preview size configured, preview_data_len=%d, preview size=%d\n", preview_data_len, SURI_PREVIEW);
+        rv = -1;
+        goto out;
+    }
+    else if (preview_data_len == 0) {
         suri_log(9, "No preview data received, continue processing\n");
         // We send http headers in preview handler, not just body
-        // ci_icap_add_xheader(req, "X-Response-Action: continue");
         // return CI_MOD_CONTINUE;
     }
 
     suri_log(7, "Injecting %d bytes into Suricata\n", preview_data_len);
-
-    // Set to -2 to distinguish uninitialized state
-    int rv = -2;
 
     if (suri_set_seq_numbers(req) == -1) {
         rv = -1;
@@ -975,7 +1021,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
             goto out;
         }
 
-        if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+        if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
             ctx->injected_since_ack = preview_data_len;
 
             // ATTENTION: In IDS mode Suricata does not detect unless we also inject these final ACK packets to flush the flow
@@ -996,7 +1042,7 @@ out:
     if (rv == 1) {
         // ATTENTION: We set X-Response-Info for the 204 response, but c-icap does not send any headers with 100 Continue
         // If we return CI_MOD_DONE, c-icap sends 500 Error to the client
-        return MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
+        return SURI_MODE == mode_allow204 ? CI_MOD_ALLOW204 : CI_MOD_CONTINUE;
     }
 
     if (result == CI_MOD_ERROR) {
@@ -1119,7 +1165,7 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
                 ctx->preview_injected = 0;  // Reset the counter as we have accounted for the preview buffer in this injection
             }
 
-            if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+            if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
                 ctx->injected_since_ack += inject_len;
             }
 
@@ -1147,12 +1193,12 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         *wlen = CI_EOF;
     }
 
-    if (!StreamTcpInlineMode() && ACKWINDOW > 0) {
+    if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
         // This io function may be called after end_of_data_handler and when we set CI_EOF above,
         // so do not inject duplicate ACK packets, hence ctx->state != FIN and ctx->injected_since_ack > 0
-        if ((ctx->injected_since_ack >= ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && ctx->state != FIN) {
+        if ((ctx->injected_since_ack >= SURI_ACKWINDOW || (iseof && ctx->injected_since_ack > 0)) && ctx->state != FIN) {
             suri_log(7, "Reached ACK window size or iseof, injecting ACK packets, injected_since_ack=%u, ACKWINDOW=%u, iseof=%d, state=%d\n",
-                ctx->injected_since_ack, ACKWINDOW, iseof, ctx->state);
+                ctx->injected_since_ack, SURI_ACKWINDOW, iseof, ctx->state);
 
             ctx->injected_since_ack = 0;
 
@@ -1181,7 +1227,7 @@ out:
 int suri_cfg_mode(const char *directive, const char **argv, void *setdata)
 {
     if (strcasecmp(argv[0], "disallow204") == 0)
-        MODE = mode_disallow204;
+        SURI_MODE = mode_disallow204;
     else {
         suri_log(1, "Unknown value '%s' for configuration parameter '%s'\n", argv[0], directive);
         return 0;
@@ -1211,7 +1257,47 @@ int suri_cfg_ackwindow(const char *directive, const char **argv, void *setdata)
     }
 
     suri_log(2, "Setting parameter: %s=%lu\n", directive, size);
-    ACKWINDOW = size;
+    SURI_ACKWINDOW = size;
+    return 1;
+}
+
+int suri_cfg_preview(const char *directive, const char **argv, void *setdata)
+{
+    if (argv == NULL || argv[0] == NULL) {
+        suri_log(1, "Missing arguments in directive %s \n", directive);
+        return 0;
+    }
+
+    errno = 0;
+    char *endptr;
+    unsigned long size = strtoul(argv[0], &endptr, 10);
+    if (errno != 0 || endptr == argv[0] || *endptr != '\0' || size > 65535) {
+        suri_log(1, "Invalid argument in directive %s \n", directive);
+        return 0;
+    }
+
+    suri_log(2, "Setting parameter: %s=%lu\n", directive, size);
+    SURI_PREVIEW = size;
+    return 1;
+}
+
+int suri_cfg_bufsize(const char *directive, const char **argv, void *setdata)
+{
+    if (argv == NULL || argv[0] == NULL) {
+        suri_log(1, "Missing arguments in directive %s \n", directive);
+        return 0;
+    }
+
+    errno = 0;
+    char *endptr;
+    unsigned long size = strtoul(argv[0], &endptr, 10);
+    if (errno != 0 || endptr == argv[0] || *endptr != '\0') {
+        suri_log(1, "Invalid argument in directive %s \n", directive);
+        return 0;
+    }
+
+    suri_log(2, "Setting parameter: %s=%lu\n", directive, size);
+    SURI_BUFSIZE = size;
     return 1;
 }
 
