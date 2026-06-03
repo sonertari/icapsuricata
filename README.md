@@ -111,14 +111,48 @@ Add the following to your `c-icap.conf`:
 # Load the module
 Service suricata_service srv_suricata.so
 
-# Mode handling configuration
+# Protocol mode: allow204|disallow204, defaults to allow204
 # suricata.Mode disallow204
+
+# ACK window size: 0-65535, defaults to 4000
+# Setting to 0 disables ACK flushes in IDS mode
+# Does not have any effect in IPS mode
+suricata.ACKwindow 4000
+
+# Preview size: 0-65535, defaults to 65535, max size allowed
+suricata.Preview 1024
+
+# Buffer size: 0-max unsigned integer, defaults to 65535, max preview size
+# icapsuricata will not start if the buffer size is smaller than the preview size
+# Setting to 0 effectively disables buffering, hence icapsuricata relies on c-icap's buffering
+# c-icap's read and write buffer sizes are 4096 by default
+suricata.BufSize 4096
 ```
 
-### Protocol Modes
+### Protocol modes
 
 * **`allow204` Mode (Preview Continuation):** The module inspects early HTTP headers and the initialization block via the preview handler. If the evaluation is inconclusive but a body exists, the module returns an ICAP `100 Continue` status code, explicitly forcing the ICAP client to stream the remaining body segments into the `suri_io` pipeline for complete inspection.
 * **`disallow204` Mode:** Forces absolute structural encapsulation of the entire HTTP transmission stream.
+
+### ACK window size
+
+* **IDS mode:** If `libsuricata` is in IDS mode, `icapsuricata` injects cross-direction ACK packets mid-stream to act as evaluation/flushing triggers for Suricata, which prevents app-layer blindspots (due to internal optimizations like skipping frame inspection on non-state-changing payload updates). The ACK window option allows users to **control how frequently to flush the flow**. Setting ACKwindow to 0 disables ACK flushes in IDS mode too. If you want to configure the shortest window, set ACKwindow to 1.
+
+* **IPS mode:** `icapsuricata` does not inject ACK packets if `libsuricata` is in IPS mode, as ACK flushing is not needed.
+
+The initial **TCP handshake** emulation for session establishment and the final **FIN|ACK sweep** to cleanly finalize the flow are required and always executed in both IDS and IPS modes.
+
+Note that ACK window size cannot be strictly applied, as it depends on many other factors like read buffer size that c-icap provides or content size in icap requests received at any time.
+
+### Preview size
+
+The Preview size is configured using the Preview option. PreviewSize is a standard c-icap directive that can be configured for all modules, but `icapsuricata` re-defines it to enforce the bufsize >= preview constraint.
+
+Note that Preview is especially useful with the 204 mode.
+
+### Buffer size
+
+The BufSize option configures the size of dual ring buffer. `icapsuricata` does not start if the buffer size is smaller than the preview size. Setting BufSize to 0 disables buffering. And if the preview size is set to 0 too, `icapsuricata` completely relies on c-icap's buffering (more specifically, `suri_io` does not read rbuf until c-icap provides a wbuf > 0).
 
 ## Proxy Configuration
 
