@@ -1138,14 +1138,17 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
             rbuf_size -= rbuf_copy_len;
         }
 
-        int suri_avail = dual_ring_buf_suri_read_available(ctx->body_buf);
-        int inject_len = suri_avail + rbuf_copy_len;
+        // ATTENTION: We inject into Suricata only when wbuf is available, in case the size of body_buf is set to 0,
+        // so we can piggyback on c-icap's buffering and avoid extra memcpy for the inject data by advancing the suri read pointer
+        int inject_len = body_buf_copy_len + rbuf_copy_len;
 
-        suri_log(5, "Current body_buf_copy_len=%d, rbuf_copy_len=%d, suri avail=%d\n", body_buf_copy_len, rbuf_copy_len, suri_avail);
+        suri_log(5, "Current body_buf_copy_len=%d, rbuf_copy_len=%d, inject_len=%d, suri avail=%zu\n",
+            body_buf_copy_len, rbuf_copy_len, inject_len, dual_ring_buf_suri_read_available(ctx->body_buf));
 
-        if (inject_len > 0) {
+        if (inject_len > 0 &&  ctx->state != FIN) {
             // Advance the suri read pointer, no memcpy
-            dual_ring_buf_suri_read(ctx->body_buf, NULL, suri_avail);
+            // suri_end_of_data_handler() consumes all remaining data after suri read pointer
+            dual_ring_buf_suri_read(ctx->body_buf, NULL, body_buf_copy_len);
 
             int wbuf_offset = 0;
             if (ctx->preview_injected > 0) {
