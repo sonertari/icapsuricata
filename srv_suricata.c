@@ -891,10 +891,17 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         ctx->block = 1;
         break;
     case 0:
+        suri_log(5, "InjectPacket did not return block, continue processing\n");
+        ci_icap_add_xheader(req, "X-Response-Info: continue");
+
+        // Seq numbers are passed from reqmod to respmod, do not send them in respmod
+        if (req->type == ICAP_RESPMOD) {
+            break;
+        }
+
         char resp_vars[64];
         if (snprintf(resp_vars, sizeof(resp_vars), "X-Response-Vars: %u,%u", ctx->client_seq, ctx->server_seq) >= 0) {
-            suri_log(5, "InjectPacket did not return block, continue processing\n");
-            ci_icap_add_xheader(req, "X-Response-Info: continue");
+            suri_log(7, "Injecting: %s\n", resp_vars);
             ci_icap_add_xheader(req, resp_vars);
             break;
         }

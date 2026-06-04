@@ -14,14 +14,14 @@ Unlike traditional setups, `icapsuricata` executes Suricata **in-line as a share
 
 The core challenge of running an interface-based packet inspection engine inside a proxy service callback is state synchronization. For example, the proxy must pass network context to Suricata for correct application of IDS signatures. Also, web proxies pass linear data buffers, whereas Suricata expects raw network layers. `icapsuricata` solves such issues through the following primary pillars:
 
-### Network Context: Extended ICAP
+### Extended ICAP: Network Context
 `icapsuricata` expects ICAP clients to provide network context via the following extended headers:
 
-- `X-Client-IP`
-- `X-Client-Port`
-- `X-Server-IP`
-- `X-Server-Port`
-- `X-Proto`
+* `X-Client-IP`
+* `X-Client-Port`
+* `X-Server-IP`
+* `X-Server-Port`
+* `X-Proto`
 
 It uses this network context when constructing emulated packets to be injected into Suricata.
 
