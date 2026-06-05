@@ -1043,7 +1043,11 @@ out:
     }
 
     if (preview_data && preview_data_len > 0) {
-        dual_ring_buf_write(ctx->body_buf, preview_data, preview_data_len);
+        int written = dual_ring_buf_write(ctx->body_buf, preview_data, preview_data_len);
+        if (written < preview_data_len) {
+            suri_log(1, "Failed to write to body_buf, written=%d < preview_data_len=%d\n", written, preview_data_len);
+            return CI_MOD_ERROR;
+        }
     }
 
     return CI_MOD_CONTINUE;
