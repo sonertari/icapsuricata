@@ -122,7 +122,7 @@ suricata.ACKwindow 4000
 # Preview size: 0-65535, defaults to 65535, max size allowed
 suricata.Preview 1024
 
-# Buffer size: from preview size to max unsigned integer, defaults to 65535, max preview size
+# Buffer size: from preview size to 4194304, defaults to 65535, max preview size
 # icapsuricata will not start if the buffer size is smaller than the preview size
 # Note that c-icap's read and write buffer sizes are 4096 by default
 suricata.BufSize 4096

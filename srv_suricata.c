@@ -118,7 +118,6 @@ enum suri_conn_state {
 // Per-request data structure
 struct suri_ctx {
     dual_ring_buf_t *body_buf;       /* accumulation buffer */
-    unsigned int preview_injected;   /* preview injected to Suricata */
     unsigned int injected_since_ack; /* bytes injected to Suricata since last ACK */
 
     unsigned int eof : 1;
@@ -1004,8 +1003,6 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         suri_log(5, "Injecting %zu bytes into Suricata, http_headers_len=%zu, preview_data_len=%d\n",
             payload_len, http_headers_len, preview_data_len);
 
-        ctx->preview_injected = preview_data_len;
-
         if ((rv = InjectPacket(req, payload, payload_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
             goto out;
         }
@@ -1273,7 +1270,8 @@ static int suri_cfg_bufsize(const char *directive, const char **argv, void *setd
     errno = 0;
     char *endptr;
     unsigned long size = strtoul(argv[0], &endptr, 10);
-    if (errno != 0 || endptr == argv[0] || *endptr != '\0') {
+    // 4 MiB max buffer size, arbitrary limit to prevent excessive memory usage
+    if (errno != 0 || endptr == argv[0] || *endptr != '\0' || size > 4194304) {
         suri_log(1, "Invalid argument in directive %s \n", directive);
         return 0;
     }
