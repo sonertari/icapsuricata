@@ -60,11 +60,27 @@ void dual_ring_buf_clear(dual_ring_buf_t *rb) {
 
 // Space reclamation is strictly dictated by whichever reader is lagging furthest behind.
 size_t dual_ring_buf_write_available(dual_ring_buf_t *rb) {
-    size_t trailing_edge = MIN(rb->read_client_ptr, rb->read_suri_ptr);
-    if (rb->write_ptr >= trailing_edge) {
-        return rb->capacity - (rb->write_ptr - trailing_edge) - 1;
+    // 1. Calculate how many bytes are currently unread by the client
+    size_t client_occupied;
+    if (rb->write_ptr >= rb->read_client_ptr) {
+        client_occupied = rb->write_ptr - rb->read_client_ptr;
+    } else {
+        client_occupied = rb->capacity - (rb->read_client_ptr - rb->write_ptr);
     }
-    return trailing_edge - rb->write_ptr - 1;
+
+    // 2. Calculate how many bytes are currently unread by Suricata
+    size_t suri_occupied;
+    if (rb->write_ptr >= rb->read_suri_ptr) {
+        suri_occupied = rb->write_ptr - rb->read_suri_ptr;
+    } else {
+        suri_occupied = rb->capacity - (rb->read_suri_ptr - rb->write_ptr);
+    }
+
+    // 3. The actual buffer occupancy is dictated by the furthest lagging reader
+    size_t max_occupied = (client_occupied > suri_occupied) ? client_occupied : suri_occupied;
+
+    // 4. Total capacity minus the maximum slots currently in use minus 1 tracking slot
+    return (rb->capacity - 1) - max_occupied;
 }
 
 size_t dual_ring_buf_write(dual_ring_buf_t *rb, const char *src, size_t len) {

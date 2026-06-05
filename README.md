@@ -122,10 +122,9 @@ suricata.ACKwindow 4000
 # Preview size: 0-65535, defaults to 65535, max size allowed
 suricata.Preview 1024
 
-# Buffer size: 0-max unsigned integer, defaults to 65535, max preview size
+# Buffer size: from preview size to max unsigned integer, defaults to 65535, max preview size
 # icapsuricata will not start if the buffer size is smaller than the preview size
-# Setting to 0 effectively disables buffering, hence icapsuricata relies on c-icap's buffering
-# c-icap's read and write buffer sizes are 4096 by default
+# Note that c-icap's read and write buffer sizes are 4096 by default
 suricata.BufSize 4096
 ```
 
@@ -152,7 +151,7 @@ Note that Preview is especially useful with the 204 mode.
 
 ### Buffer size
 
-The BufSize option configures the size of dual ring buffer. `icapsuricata` does not start if the buffer size is smaller than the preview size. Setting BufSize to 0 disables buffering. And if the preview size is set to 0 too, `icapsuricata` completely relies on c-icap's buffering (more specifically, `suri_io` does not read rbuf until c-icap provides a wbuf > 0).
+The BufSize option configures the size of dual ring buffer. `icapsuricata` does not start if the buffer size is smaller than the preview size.
 
 ## Proxy Configuration
 

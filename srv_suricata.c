@@ -1001,7 +1001,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     }
 
     if (payload_len > 0) {
-        suri_log(7, "Inject PUSH|ACK payload packet, payload_len=%zu, http_headers_len=%zu, preview_data_len=%d\n",
+        suri_log(5, "Injecting %zu bytes into Suricata, http_headers_len=%zu, preview_data_len=%d\n",
             payload_len, http_headers_len, preview_data_len);
 
         ctx->preview_injected = preview_data_len;
@@ -1043,11 +1043,15 @@ out:
     }
 
     if (preview_data && preview_data_len > 0) {
+        suri_log(5, "Buffer preview data, preview_data_len=%d\n", preview_data_len);
         int written = dual_ring_buf_write(ctx->body_buf, preview_data, preview_data_len);
         if (written < preview_data_len) {
             suri_log(1, "Failed to write to body_buf, written=%d < preview_data_len=%d\n", written, preview_data_len);
             return CI_MOD_ERROR;
         }
+
+        // Advance the suri read pointer since we have already injected the preview data, no memcpy
+        dual_ring_buf_suri_read(ctx->body_buf, NULL, preview_data_len);
     }
 
     return CI_MOD_CONTINUE;
@@ -1112,79 +1116,57 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
     // Set to -2 to distinguish uninitialized state
     int rv = -2;
 
-    int rbuf_size = rlen ? *rlen : 0;
-    int rbuf_copy_len = 0;
+    if (rbuf && rlen && *rlen > 0) {
+        suri_log(5, "Buffer incoming data, rlen=%d\n", *rlen);
+        int written = dual_ring_buf_write(ctx->body_buf, rbuf, *rlen);
+        if (written < *rlen) {
+            suri_log(1, "Failed to write to body_buf, written=%d < rlen=%d\n", written, *rlen);
+        }
+        // Tell c-icap that we consumed some or all of the rbuf data
+        *rlen = written;
+    }
 
     if (wbuf && wlen && *wlen > 0) {
-        int wbuf_size = *wlen;
         int body_buf_copy_len = dual_ring_buf_client_read_available(ctx->body_buf);
 
         if (body_buf_copy_len > 0) {
-            body_buf_copy_len = body_buf_copy_len < wbuf_size ? body_buf_copy_len : wbuf_size;
+            body_buf_copy_len = body_buf_copy_len < *wlen ? body_buf_copy_len : *wlen;
 
             suri_log(5, "Send %d bytes from body_buf to client\n", body_buf_copy_len);
-            body_buf_copy_len = dual_ring_buf_client_read(ctx->body_buf, wbuf, body_buf_copy_len);
-
-            wbuf_size -= body_buf_copy_len;
+            int written = dual_ring_buf_client_read(ctx->body_buf, wbuf, body_buf_copy_len);
+            if (written < body_buf_copy_len) {
+                suri_log(1, "Failed to write to wbuf, written=%d < body_buf_copy_len=%d\n", written, body_buf_copy_len);
+            }
+            body_buf_copy_len = written;
         }
-
+        // Tell c-icap how many bytes we have written to wbuf to be sent to the client
         // This sets *wlen to 0 if we have no data to send, so we can set *wlen to CI_EOF below if iseof
         *wlen = body_buf_copy_len;
-
-        if (rbuf && rlen && rbuf_size > 0 && wbuf_size > 0) {
-            rbuf_copy_len = (rbuf_size < wbuf_size) ? rbuf_size : wbuf_size;
-
-            suri_log(5, "Send %d bytes from rbuf to client\n", rbuf_copy_len);
-            memcpy(wbuf + *wlen, rbuf, rbuf_copy_len);
-
-            *wlen += rbuf_copy_len;
-            *rlen = rbuf_copy_len;
-            rbuf_size -= rbuf_copy_len;
-        }
-
-        // ATTENTION: We inject into Suricata only when wbuf is available, in case the size of body_buf is set to 0,
-        // so we can piggyback on c-icap's buffering and avoid extra memcpy for the inject data by advancing the suri read pointer
-        int inject_len = body_buf_copy_len + rbuf_copy_len;
-
-        suri_log(5, "Current body_buf_copy_len=%d, rbuf_copy_len=%d, inject_len=%d, suri avail=%zu\n",
-            body_buf_copy_len, rbuf_copy_len, inject_len, dual_ring_buf_suri_read_available(ctx->body_buf));
-
-        if (inject_len > 0 &&  ctx->state != FIN) {
-            // Advance the suri read pointer, no memcpy
-            // suri_end_of_data_handler() consumes all remaining data after suri read pointer
-            dual_ring_buf_suri_read(ctx->body_buf, NULL, body_buf_copy_len);
-
-            int wbuf_offset = 0;
-            if (ctx->preview_injected > 0) {
-                inject_len -= ctx->preview_injected;
-                wbuf_offset = ctx->preview_injected;
-                ctx->preview_injected = 0;  // Reset the counter as we have accounted for the preview buffer in this injection
-            }
-
-            if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
-                ctx->injected_since_ack += inject_len;
-            }
-
-            suri_log(5, "Injecting %d bytes into Suricata, wbuf_offset=%d\n", inject_len, wbuf_offset);
-            if ((rv = InjectPacket(req, wbuf + wbuf_offset, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
-                *wlen = 0;  // Tell c-icap not to send wbuf to the client
-                goto out;
-            }
-        }
-
-        suri_log(5, "Current wlen=%d, rlen=%d\n", *wlen, rlen ? *rlen : 0);
     }
 
-    if (rbuf && rlen && rbuf_size > 0) {
-        suri_log(5, "Buffer new data not sent, rbuf_size=%d\n", rbuf_size);
-        int written = dual_ring_buf_write(ctx->body_buf, rbuf + rbuf_copy_len, rbuf_size);
-        if (written < rbuf_size) {
-            suri_log(1, "Failed to write to body_buf, written=%d < rbuf_size=%d\n", written, rbuf_size);
+    // suri_check_preview_handler() advances the suri read pointer for the preview data
+    int inject_len = dual_ring_buf_suri_read_available(ctx->body_buf);
+
+    // suri_end_of_data_handler() consumes all remaining data after the suri read pointer
+    if (inject_len > 0 &&  ctx->state != FIN) {
+        char inject_buf[inject_len];
+        dual_ring_buf_suri_read(ctx->body_buf, inject_buf, inject_len);
+
+        if (!StreamTcpInlineMode() && SURI_ACKWINDOW > 0) {
+            ctx->injected_since_ack += inject_len;
         }
-        *rlen = rbuf_copy_len + written;  // Tell c-icap that we consumed some of the rbuf data
+
+        suri_log(5, "Injecting %d bytes into Suricata\n", inject_len);
+        if ((rv = InjectPacket(req, inject_buf, inject_len, TH_PUSH|TH_ACK, req->type == ICAP_REQMOD ? 1 : 0)) != 0) {
+            *wlen = 0;  // Tell c-icap not to send wbuf to the client
+            goto out;
+        }
     }
 
-    if (wlen && *wlen == 0 && (ctx->eof == 1 || iseof)) {
+    int client_avail = dual_ring_buf_client_read_available(ctx->body_buf);
+    suri_log(5, "Current *rlen=%d, *wlen=%d, client_avail=%d, inject_len=%d\n", rlen ? *rlen : 0, wlen ? *wlen : 0, client_avail, inject_len);
+
+    if (wlen && *wlen == 0 && (ctx->eof == 1 || iseof) && client_avail == 0) {
         suri_log(5, "Set EOF\n");
         *wlen = CI_EOF;
     }
