@@ -91,7 +91,7 @@ libsuricata-config --libs
 ## Build
 
 ```bash
-cd icap/
+cd icapsuricata/
 make
 # → produces  srv_suricata.so
 ```
@@ -116,7 +116,7 @@ Service suricata_service srv_suricata.so
 
 # ACK window size: 0-65535, defaults to 4000
 # Setting to 0 disables ACK flushes in IDS mode
-# Does not have any effect in IPS mode
+# icapsuricata will not start if ACKwindow is specified in IPS mode
 suricata.ACKwindow 4000
 
 # Preview size: 0-65535, defaults to 65535, max size allowed
