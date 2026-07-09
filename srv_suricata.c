@@ -107,6 +107,10 @@ static pthread_t   g_worker_tid = 0;
 static int         g_suri_ready = 0;   /* set to 1 after SuricataPostInit */
 static pid_t       g_parent_pid = 0;   /* Tracks which process initialized Suricata */
 
+// TODO: Implement thread level thread vars, instead of the global g_worker_tv, and remove this global mutex.
+// Global mutex for Suricata engine access
+pthread_mutex_t suricata_injection_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 enum suri_conn_state {
     SYN = 0,
     SYN_ACK,
@@ -212,11 +216,14 @@ static int SuricataRunModeSetup(void)
     // so we do not want the engine to complain about clock skew.
     TimeModeSetOffline();
 
+    pthread_mutex_lock(&suricata_injection_mutex);
     g_worker_tv = SCRunModeLibCreateThreadVars(1 /* worker_id */);
     if (g_worker_tv == NULL) {
+        pthread_mutex_unlock(&suricata_injection_mutex);
         suri_log(1, "SCRunModeLibCreateThreadVars failed\n");
         return -1;
     }
+    pthread_mutex_unlock(&suricata_injection_mutex);
     return 0;
 }
 
@@ -257,10 +264,13 @@ static void *SuricataWorkerThread(void *arg)
 
     suri_log(9, "ENTER\n");
 
+    pthread_mutex_lock(&suricata_injection_mutex);
     if (SCRunModeLibSpawnWorker(g_worker_tv) != 0) {
+        pthread_mutex_unlock(&suricata_injection_mutex);
         suri_log(1, "SCRunModeLibSpawnWorker failed\n");
         pthread_exit((void *)(intptr_t)EXIT_FAILURE);
     }
+    pthread_mutex_unlock(&suricata_injection_mutex);
 
     suri_log(5, "SuricataMainLoop()\n");
     SuricataMainLoop();
@@ -268,10 +278,12 @@ static void *SuricataWorkerThread(void *arg)
     // Note that there is some thread synchronization between this
     // function and SuricataShutdown such that they must be run
     // concurrently at this time before either will exit.
+    pthread_mutex_lock(&suricata_injection_mutex);
     if (g_worker_tv != NULL) {
         suri_log(5, "SCTmThreadsSlotPacketLoopFinish()\n");
         SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
     }
+    pthread_mutex_unlock(&suricata_injection_mutex);
 
     suri_log(5, "EXIT\n");
     pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
@@ -549,6 +561,7 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     }
 
     if (GetLiveDevice(req) == NULL) {
+        free(pkt);
         return -1;
     }
 
@@ -563,7 +576,9 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     if (PacketSetData(p, pkt, pkt_len) == -1) {
         suri_log(1, "PacketSetData failed\n");
         free(pkt);
+        pthread_mutex_lock(&suricata_injection_mutex);
         TmqhOutputPacketpool(g_worker_tv, p);
+        pthread_mutex_unlock(&suricata_injection_mutex);
         return -1;
     }
 
@@ -596,12 +611,15 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
     // Push packet into the detection pipeline.
     // TmThreadsSlotProcessPkt() is the canonical library-mode injection call
     // (see examples/lib/custom/main.c).
+    pthread_mutex_lock(&suricata_injection_mutex);
     if (TmThreadsSlotProcessPkt(g_worker_tv, g_worker_tv->tm_slots, p) != TM_ECODE_OK) {
-        suri_log(1, "TmThreadsSlotProcessPkt failed\n");
-        free(pkt);
         TmqhOutputPacketpool(g_worker_tv, p);
+        pthread_mutex_unlock(&suricata_injection_mutex);
+        suri_log(1, "TmThreadsSlotProcessPkt failed\n");
+        // free(pkt);
         return -1;
     }
+    pthread_mutex_unlock(&suricata_injection_mutex);
 
     int rv = 0;
 
