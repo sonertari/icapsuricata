@@ -128,6 +128,8 @@ struct suri_ctx {
     unsigned int client_ip_set : 1;
     uint16_t client_port;
     unsigned int client_port_set : 1;
+    uint16_t icap_client_port;
+    unsigned int icap_client_port_set : 1;
     uint32_t server_ip;
     unsigned int server_ip_set : 1;
     uint16_t server_port;
@@ -318,6 +320,42 @@ static uint32_t GetClientPort(ci_request_t *req)
     return ctx->client_port;
 }
 
+static uint32_t GetIcapClientPort(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+
+    if (ctx->icap_client_port_set) {
+        return ctx->icap_client_port;
+    }
+
+    ctx->icap_client_port = GetClientPort(req);  /* Fallback to X-Client-Port */
+    ctx->icap_client_port_set = 1;
+
+    if (req && req->connection) {
+        int icap_fd = req->connection->fd;
+
+        if (icap_fd >= 0) {
+            struct sockaddr_storage local_addr;
+            socklen_t addr_len = sizeof(local_addr);
+
+            // Get the remote port of the ICAP client connection (ephemeral port)
+            if (getpeername(icap_fd, (struct sockaddr *)&local_addr, &addr_len) == 0) {
+                if (local_addr.ss_family == AF_INET) {
+                    struct sockaddr_in *s = (struct sockaddr_in *)&local_addr;
+                    ctx->icap_client_port = s->sin_port;
+                } else if (local_addr.ss_family == AF_INET6) {
+                    struct sockaddr_in6 *s = (struct sockaddr_in6 *)&local_addr;
+                    ctx->icap_client_port = s->sin6_port;
+                }
+
+                suri_log(7, "ICAP client port: %u\n", ntohs(ctx->icap_client_port));
+            }
+        }
+    }
+
+    return ctx->icap_client_port;
+}
+
 static uint32_t GetServerIP(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
@@ -461,8 +499,12 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
     hdr->ip.daddr = toserver ? GetServerIP(req) : GetClientIP(req);
 
     if (hdr->ip.protocol == IPPROTO_TCP) {
-        hdr->tcp.th_sport = toserver ? GetClientPort(req) : GetServerPort(req);
-        hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetClientPort(req);
+        // TODO: Get client port from GetClientPort() for h1 connections and GetIcapClientPort() for h2 connections.
+        // For now, we use GetIcapClientPort() for all connections.
+        // hdr->tcp.th_sport = toserver ? GetClientPort(req) : GetServerPort(req);
+        // hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetClientPort(req);
+        hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
+        hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
 
         hdr->tcp.doff = 5;                  /* 5 dwords = 20 bytes, no options */
         hdr->tcp.syn = flags & TH_SYN ? 1 : 0;
