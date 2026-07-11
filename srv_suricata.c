@@ -395,7 +395,7 @@ static uint32_t GetClientIP(ci_request_t *req)
     return ctx->client_ip;
 }
 
-static uint32_t GetClientPort(ci_request_t *req)
+static uint16_t GetClientPort(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
     suri_log(9, "X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
@@ -413,7 +413,7 @@ static uint32_t GetClientPort(ci_request_t *req)
     return ctx->client_port;
 }
 
-static uint32_t GetIcapClientPort(ci_request_t *req)
+static uint16_t GetIcapClientPort(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
 
@@ -570,7 +570,10 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
     struct suri_ctx *ctx = ci_service_data(req);
 
     size_t header_len = sizeof(struct fake_pkt_hdr);
-    *pkt_len = header_len + data_len;
+    // Allocate 4 extra bytes for the TCP option (Kind + Length + 2-byte Port)
+    size_t opt_len = (GetProto(req) == IPPROTO_TCP) ? 4 : 0;
+
+    *pkt_len = header_len + opt_len + data_len;
 
     uint8_t *pkt = malloc(*pkt_len);
     if (pkt == NULL) {
@@ -578,8 +581,10 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
         return NULL;
     }
 
+    // Zero out both the fake header block and the option block
+    memset(pkt, 0, header_len + opt_len);
+
     struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt;
-    memset(hdr, 0, header_len);
 
     hdr->ip.version = 4;
     hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
@@ -593,14 +598,12 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
     hdr->ip.daddr = toserver ? GetServerIP(req) : GetClientIP(req);
 
     if (hdr->ip.protocol == IPPROTO_TCP) {
-        // TODO: Get client port from GetClientPort() for h1 connections and GetIcapClientPort() for h2 connections.
-        // For now, we use GetIcapClientPort() for all connections.
-        // hdr->tcp.th_sport = toserver ? GetClientPort(req) : GetServerPort(req);
-        // hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetClientPort(req);
+        // Use ICAP client port for the standard L4 tuple
+        // This allows Suricata to distinguish different h2 streams.
         hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
         hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
 
-        hdr->tcp.doff = 5;                  /* 5 dwords = 20 bytes, no options */
+        hdr->tcp.doff = 6;                  /* 6 dwords = 24 bytes (20B header + 4B option) */
         hdr->tcp.syn = flags & TH_SYN ? 1 : 0;
         hdr->tcp.ack = flags & TH_ACK ? 1 : 0;
         hdr->tcp.psh = flags & TH_PUSH ? 1 : 0;
@@ -615,12 +618,24 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
         hdr->tcp.th_seq = toserver ? htonl(ctx->client_seq) : htonl(ctx->server_seq);
         hdr->tcp.th_ack = toserver ? htonl(ctx->client_ack) : htonl(ctx->server_ack);
 
-        // Revert byte order by htonl() for printing
-        suri_log(7, "Set %s seq=%u, ack=%u\n", toserver ? "client" : "server", htonl(hdr->tcp.th_seq), htonl(hdr->tcp.th_ack));
+        // Inject the actual client port as a TCP option
+        uint8_t *opt_ptr = pkt + header_len;
+        uint16_t actual_client_port = GetClientPort(req);
+
+        opt_ptr[0] = 78;   // Option Kind: Historical Proxy/Enterprise Option
+        opt_ptr[1] = 4;    // Option Length: 4 bytes total
+        opt_ptr[2] = (actual_client_port >> 8) & 0xFF; // Port high byte
+        opt_ptr[3] = actual_client_port & 0xFF;        // Port low byte
+
+        // Revert byte order for printing
+        suri_log(7, "Set %s seq=%u, ack=%u, real_port=%u, icap_client_port=%u\n",
+                 toserver ? "client" : "server", ntohl(hdr->tcp.th_seq), ntohl(hdr->tcp.th_ack),
+                 ntohs(actual_client_port), ntohs(GetIcapClientPort(req)));
     }
 
     if (data_len > 0) {
-        memcpy(pkt + header_len, data, data_len);
+        // Shift data target forward to account for the option length
+        memcpy(pkt + header_len + opt_len, data, data_len);
     }
     return pkt;
 }
