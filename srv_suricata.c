@@ -380,36 +380,40 @@ struct __attribute__((__packed__)) fake_pkt_hdr {
 static uint32_t GetClientIP(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-    suri_log(9, "X-Client-IP=%s\n", ci_icap_request_get_header(req, "X-Client-IP"));
 
-    if (!ctx->client_ip_set) {
-        ctx->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-        ctx->client_ip_set = 1;
-
-        const char *ip_str = ci_icap_request_get_header(req, "X-Client-IP");
-        if (ip_str) {
-            inet_pton(AF_INET, ip_str, &ctx->client_ip);
-        }
+    if (ctx->client_ip_set) {
+        return ctx->client_ip;
     }
 
+    ctx->client_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+    ctx->client_ip_set = 1;
+
+    const char *ip_str = ci_icap_request_get_header(req, "X-Client-IP");
+    if (ip_str) {
+        inet_pton(AF_INET, ip_str, &ctx->client_ip);
+    }
+
+    suri_log(9, "X-Client-IP=%s\n", ip_str ? ip_str : "not set, using fallback");
     return ctx->client_ip;
 }
 
 static uint16_t GetClientPort(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-    suri_log(9, "X-Client-Port=%s\n", ci_icap_request_get_header(req, "X-Client-Port"));
 
-    if (!ctx->client_port_set) {
-        ctx->client_port = htons(12345);  /* Fallback to 12345 */
-        ctx->client_port_set = 1;
-
-        const char *port_str = ci_icap_request_get_header(req, "X-Client-Port");
-        if (port_str) {
-            ctx->client_port = htons(atoi(port_str));
-        }
+    if (ctx->client_port_set) {
+        return ctx->client_port;
     }
 
+    ctx->client_port = htons(12345);  /* Fallback to 12345 */
+    ctx->client_port_set = 1;
+
+    const char *port_str = ci_icap_request_get_header(req, "X-Client-Port");
+    if (port_str) {
+        ctx->client_port = htons(atoi(port_str));
+    }
+
+    suri_log(9, "X-Client-Port=%s\n", port_str ? port_str : "not set, using fallback");
     return ctx->client_port;
 }
 
@@ -441,66 +445,71 @@ static uint16_t GetIcapClientPort(ci_request_t *req)
                     struct sockaddr_in6 *s = (struct sockaddr_in6 *)&local_addr;
                     ctx->icap_client_port = s->sin6_port;
                 }
-
-                suri_log(7, "ICAP client port: %u\n", ntohs(ctx->icap_client_port));
             }
         }
     }
 
+    suri_log(9, "ICAP client port: %u\n", ntohs(ctx->icap_client_port));
     return ctx->icap_client_port;
 }
 
 static uint32_t GetServerIP(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-    suri_log(9, "X-Server-IP=%s\n", ci_icap_request_get_header(req, "X-Server-IP"));
 
-    if (!ctx->server_ip_set) {
-        ctx->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
-        ctx->server_ip_set = 1;
-
-        const char *ip_str = ci_icap_request_get_header(req, "X-Server-IP");
-        if (ip_str) {
-            inet_pton(AF_INET, ip_str, &ctx->server_ip);
-        }
+    if (ctx->server_ip_set) {
+        return ctx->server_ip;
     }
 
+    ctx->server_ip = htonl(0x7F000001);  /* Fallback to 127.0.0.1 */
+    ctx->server_ip_set = 1;
+
+    const char *ip_str = ci_icap_request_get_header(req, "X-Server-IP");
+    if (ip_str) {
+        inet_pton(AF_INET, ip_str, &ctx->server_ip);
+    }
+
+    suri_log(9, "X-Server-IP=%s\n", ip_str ? ip_str : "not set, using fallback");
     return ctx->server_ip;
 }
 
 static uint32_t GetServerPort(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-    suri_log(9, "X-Server-Port=%s\n", ci_icap_request_get_header(req, "X-Server-Port"));
 
-    if (!ctx->server_port_set) {
-        ctx->server_port = htons(80);  /* Fallback to 80 */
-        ctx->server_port_set = 1;
-
-        const char *port_str = ci_icap_request_get_header(req, "X-Server-Port");
-        if (port_str) {
-            ctx->server_port = htons(atoi(port_str));
-        }
+    if (ctx->server_port_set) {
+        return ctx->server_port;
     }
 
+    ctx->server_port = htons(80);  /* Fallback to 80 */
+    ctx->server_port_set = 1;
+
+    const char *port_str = ci_icap_request_get_header(req, "X-Server-Port");
+    if (port_str) {
+        ctx->server_port = htons(atoi(port_str));
+    }
+
+    suri_log(9, "X-Server-Port=%s\n", port_str ? port_str : "not set, using fallback");
     return ctx->server_port;
 }
 
 static uint8_t GetProto(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
-    suri_log(9, "X-Proto=%s\n", ci_icap_request_get_header(req, "X-Proto"));
 
-    if (!ctx->proto_set) {
-        ctx->proto = IPPROTO_TCP;     /* Default to TCP */
-        ctx->proto_set = 1;
-
-        const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
-        if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
-            ctx->proto = IPPROTO_UDP;
-        }
+    if (ctx->proto_set) {
+        return ctx->proto;
     }
 
+    ctx->proto = IPPROTO_TCP;     /* Default to TCP */
+    ctx->proto_set = 1;
+
+    const char *proto_str = ci_icap_request_get_header(req, "X-Proto");
+    if (proto_str && strcasecmp(proto_str, "UDP") == 0) {
+        ctx->proto = IPPROTO_UDP;
+    }
+
+    suri_log(9, "X-Proto=%s\n", proto_str ? proto_str : "not set, using default TCP");
     return ctx->proto;
 }
 
@@ -508,16 +517,18 @@ static LiveDevice *GetLiveDevice(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
 
-    if (!ctx->dev_set) {
-        ctx->dev_set = 1;
+    if (ctx->dev_set) {
+        return ctx->dev;
+    }
 
-        ctx->dev = LiveGetDevice("suri_icap0");
-        if (ctx->dev == NULL) {
-            suri_log(1, "LiveGetDevice failed\n");
-        }
-        else {
-            suri_log(5, "Obtained LiveDevice for injection\n");
-        }
+    ctx->dev_set = 1;
+
+    ctx->dev = LiveGetDevice("suri_icap0");
+    if (ctx->dev == NULL) {
+        suri_log(1, "LiveGetDevice failed\n");
+    }
+    else {
+        suri_log(5, "Obtained LiveDevice for injection\n");
     }
 
     return ctx->dev;
