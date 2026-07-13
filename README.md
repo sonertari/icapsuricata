@@ -15,6 +15,7 @@ Unlike traditional setups, `icapsuricata` executes Suricata **in-line as a share
 The core challenge of running an interface-based packet inspection engine inside a proxy service callback is state synchronization. For example, the proxy must pass network context to Suricata for correct application of IDS signatures. Also, web proxies pass linear data buffers, whereas Suricata expects raw network layers. `icapsuricata` solves such issues through the following primary pillars:
 
 ### Extended ICAP: Network Context
+
 `icapsuricata` expects ICAP clients to provide network context via the following extended headers:
 
 * `X-Client-IP`
@@ -31,30 +32,52 @@ It uses this network context when constructing emulated packets to be injected i
 X-Response-Info: blocked
 ```
 
-It also expects icap clients to echo back the `X-Response-Vars` header it injects into its responses to clients. `icapsuricata` uses the values in `X-Response-Vars` internally, to initialize client and server sequence numbers when injecting emulated packets into Suricata in RESPMOD. (The `X-Response-Vars` header may be removed in the future.)
+It also expects icap clients to echo back the `X-Response-Vars` header it injects into its responses to clients. `icapsuricata` uses the values in `X-Response-Vars` internally, to initialize client and server sequence numbers when injecting emulated packets into Suricata in RESPMOD.
 
 ```text
 X-Response-Vars: 3493600807,3338221217
 ```
 
-Currently, `icapsuricata` and the ICAP subsystem in `SSLproxy` support HTTP/1 only. But, the goal is to add support for other protocols, especially HTTP/2 and HTTP/3.
+### Protocol Support
+
+Currently, `icapsuricata` expects the `X-Proto` header to contain `TCP` only (this requirement may change in the future as new protocol support are added).
+
+* **HTTP/1:** `icapsuricata` and the ICAP subsystem in `SSLproxy` support HTTP/1. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H1 connection, and passes H1 headers directly to it.
+
+* **HTTP/2:** `icapsuricata` does not support HTTP/2. But, `SSLproxy` supports HTTP/2. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H2 stream, and translates H2 headers into H1 equivalents, before injecting the packets into `Suricata`. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H2. So, `icapsuricata` never receives any H2 header.
+
+`icapsuricata` always uses the client port of the ICAP connection for that connection/stream as the client port in the emulated TCP packets injected into `Suricata`. This allows `Suricata` to distinguish different H2 streams, otherwise they all would have the same client port, which would confuse the flow tracking in `Suricata`. But, it also adds the actual client port in the `X-Client-Port` header to the emulated packet as the common TCP option kind `78`, so that standard packet dissecting layers can recognize and pull the actual client port in that TCP option.
+
+The goal is to add support for other protocols, especially HTTP/3.
 
 ### Dual-Reader Circular Buffer (Zero Heap Churn)
+
 To handle streaming payloads safely, the module manages memory via a high-performance, single-writer, dual-reader circular ring buffer. 
+
 * **The Writer:** Drains volatile incoming raw buffers from `c-icap` (`rbuf`) immediately to enforce TCP window backpressure and avoid network stalls.
+
 * **Reader 1 (Client Queue):** Safely drains data out to the outbound network socket block-by-block.
+
 * **Reader 2 (Suricata Queue):** Accumulates data independently into optimal chunk boundaries (typically 4KB alignment) before staging it for packetization.
+
 * **Space Reclamation:** Memory allocations are circular and strictly bound. Space is infinitely recycled the millisecond *both* readers have successfully advanced past a given index, completely eliminating runtime memory fragmentation (`realloc` loops).
 
 ### Low-Overhead Network Emulation Pipeline
-Because `libsuricata` expects raw wire infrastructure, `icapsuricata` acts as a synthetic network tap. For every data transaction, it dynamically manufactures complete, valid, in-memory IPv4 and TCP frames containing appropriate hardware routing vectors, and TCP sequence space offsets.
+
+Because `libsuricata` expects raw wire infrastructure, `icapsuricata` acts as a synthetic network tap. For every data transaction, it dynamically manufactures complete, valid, in-memory IPv4 and TCP frames containing appropriate hardware routing vectors, and TCP sequence space offsets. `icapsuricata` supports multithreaded access to `libsuricata`.
 
 * **Handshake Generation:** Upon session initialization, the module simulates mock TCP handshakes to initialize Suricata’s internal flow engine.
+
 * **Secure Random ISN:** The module initializes sequence numbers securely using `/dev/urandom`.
+
 * **Sequential Stream Tracking:** As data steps through the ring buffer, payloads are wrapped into standard `PUSH|ACK` packets.
+
 * **State Finalization:** When the ICAP connection path flags an End-of-Data state (`iseof`), the module seamlessly injects sequentially correct `FIN|ACK` packet sweeps to cleanly close Suricata's internal state machine, forcing terminal application sweeps and releasing flow locks without hanging on idle timeouts.
 
+* **Thread-local Variables per Worker Thread:** When calling `libsuricata` functions in parallel, multiple worker threads should never use common thread variables (otherwise crashes Suricata). Instead of serializing such `libsuricata` calls by global locking, each c-icap worker thread in `icapsuricata` uses its own thread-local thread variables, which allows for full parallel access to `libsuricata`.
+
 ### Progressive Mid-Stream Flushing
+
 Instead of executing computationally heavy deep packet evaluation matrices on every micro-write, or conversely, waiting until the final connection close to discover an exploit, `icapsuricata` uses a balanced chunk flushing architecture. 
 
 Data is packetized and evaluation cycles are triggered dynamically as chunks clear the ring buffer (e.g., every 4KB). This forces Suricata’s `StreamTcp` engine to regularly reassemble and push its content windows up to the Application Layer (`AppLayer`), allowing signatures leveraging keywords like `http.response_body` to match fragments split across multiple injections and stop active threats mid-transit.
@@ -164,7 +187,7 @@ icap://<host>:1344/suricata
 For example, you can use the following ICAP specification with SSLproxy:
 
 ```text
-Icap icap://127.0.0.1:1344,suricata,suricata,open,open,10,1024,0,yes,no,X-Response-Vars
+Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,yes,no,X-Response-Vars
 ```
 See the [icap branch](https://github.com/sonertari/SSLproxy/tree/icap) in the SSLproxy project for details.
 
