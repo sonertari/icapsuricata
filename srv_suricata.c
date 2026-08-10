@@ -610,7 +610,7 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
 
     if (hdr->ip.protocol == IPPROTO_TCP) {
         // Use ICAP client port for the standard L4 tuple
-        // This allows Suricata to distinguish different h2 streams.
+        // This allows Suricata to distinguish different h2/h3 streams.
         hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
         hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
 

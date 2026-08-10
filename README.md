@@ -40,15 +40,17 @@ X-Response-Vars: 3493600807,3338221217
 
 ### Protocol Support
 
-Currently, `icapsuricata` expects the `X-Proto` header to contain `TCP` only (this requirement may change in the future as new protocol support are added).
+Currently, `icapsuricata` assumes the protocol is `tcp` unless the `X-Proto` header contains `udp` (this requirement may change in the future as new protocol support are added). Depending on the protocol, SSLproxy sends `http`, `https`, `http2`, or `http3` in the `X-Proto` header.
 
 * **HTTP/1:** `icapsuricata` and the ICAP subsystem in `SSLproxy` support HTTP/1. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H1 connection, and passes H1 headers directly to it.
 
-* **HTTP/2:** `icapsuricata` does not support HTTP/2. But, `SSLproxy` supports HTTP/2. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H2 stream, and translates H2 headers into H1 equivalents, before injecting the packets into `Suricata`. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H2. So, `icapsuricata` never receives any H2 header.
+* **HTTP/2:** `icapsuricata` does not support HTTP/2, nor does it need to. `SSLproxy` supports HTTP/2. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H2 stream, and translates H2 headers into H1 equivalents. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H2. So, `icapsuricata` never receives any H2 header.
 
-`icapsuricata` always uses the client port of the ICAP connection for that connection/stream as the client port in the emulated TCP packets injected into `Suricata`. This allows `Suricata` to distinguish different H2 streams, otherwise they all would have the same client port, which would confuse the flow tracking in `Suricata`. But, it also adds the actual client port in the `X-Client-Port` header to the emulated packet as the common TCP option kind `78`, so that standard packet dissecting layers can recognize and pull the actual client port in that TCP option.
+* **HTTP/3 and QUIC:** `icapsuricata` does not support HTTP/3 or QUIC, nor does it need to. `SSLproxy` supports HTTP/3 and QUIC. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H3 stream, and translates H3 headers into H1 equivalents. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H3. So, `icapsuricata` never receives any H3 header.
 
-The goal is to add support for other protocols, especially HTTP/3.
+`icapsuricata` always uses the client port of the ICAP connection for that connection/stream as the client port in the emulated TCP packets injected into `Suricata`. This allows `Suricata` to distinguish different H2 and H3 streams, otherwise they all would have the same client port, which would confuse the flow tracking in `Suricata`. But, it also adds the actual client port in the `X-Client-Port` header to the emulated packet as the common TCP option kind `78`, so that standard packet dissecting layers can recognize and pull the actual client port in that TCP option.
+
+The goal is to add support for other protocols.
 
 ### Dual-Reader Circular Buffer (Zero Heap Churn)
 
