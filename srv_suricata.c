@@ -1061,14 +1061,14 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
     struct suri_ctx *ctx = ci_service_data(req);
 
     // Avoid duplicate xheaders
-    const char *(*get_header)(ci_request_t *req, const char *header) =
-        req->type == ICAP_REQMOD ? ci_icap_request_get_header : ci_icap_response_get_header;
     const char *xheader = NULL;
 
     switch (rv) {
     case 1:
         suri_log(5, "InjectPacket returned block\n");
-        xheader = get_header(req, "X-Response-Info");
+        if (req->xheaders) {
+            xheader = ci_headers_value(req->xheaders, "X-Response-Info");
+        }
         if (!xheader || strcasecmp(xheader, "blocked") != 0) {
             ci_icap_add_xheader(req, "X-Response-Info: blocked");
         }
@@ -1079,7 +1079,9 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         break;
     case 0:
         suri_log(5, "InjectPacket did not return block, continue processing\n");
-        xheader = get_header(req, "X-Response-Info");
+        if (req->xheaders) {
+            xheader = ci_headers_value(req->xheaders, "X-Response-Info");
+        }
         if (!xheader || strcasecmp(xheader, "continue") != 0) {
             ci_icap_add_xheader(req, "X-Response-Info: continue");
         }
@@ -1092,7 +1094,7 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             break;
         }
 
-        if (get_header(req, "X-Response-Vars")) {
+        if (req->xheaders && ci_headers_value(req->xheaders, "X-Response-Vars")) {
             suri_log(5, "X-Response-Vars already set\n");
             break;
         }
@@ -1107,7 +1109,9 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         // fall through to error handling
     case -1:
         suri_log(1, "InjectPacket failed\n");
-        xheader = get_header(req, "X-Response-Info");
+        if (req->xheaders) {
+            xheader = ci_headers_value(req->xheaders, "X-Response-Info");
+        }
         if (!xheader || strcasecmp(xheader, "error") != 0) {
             ci_icap_add_xheader(req, "X-Response-Info: error");
         }
