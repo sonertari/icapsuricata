@@ -6,7 +6,7 @@
 #      source).  Adjust CICAP_PREFIX if installed in a non-standard location.
 #
 #   2. Suricata built and installed as a library:
-#        ./configure --enable-shared ...
+#        ./configure ...
 #        make && sudo make install
 #        sudo make install-library install-headers
 #      After that, `libsuricata-config` must be on your PATH.
@@ -23,11 +23,11 @@ INSTALL ?= install
 
 # ── c-icap settings ──────────────────────────────────────────────────────────
 # Use c-icap's pkg-config if available; otherwise fall back to manual paths.
-CICAP_PREFIX   ?= /usr
+CICAP_PREFIX   ?= /usr/local
 
 # Capture any hidden compiler macros required by the libraries, but should work without it too
 CICAP_CFLAGS   := $(shell pkg-config --cflags c_icap 2>/dev/null || \
-                   echo -I$(CICAP_PREFIX)/include/c-icap)
+                   echo -I$(CICAP_PREFIX)/include)
 
 # ── libsuricata settings ──────────────────────────────────────────────────────
 SURI_CFLAGS    := $(shell libsuricata-config --cflags 2>/dev/null)
@@ -39,12 +39,12 @@ SURI_LDFLAGS   := $(shell libsuricata-config --libs)
 CFLAGS  := -O2 -g -Wall -Wextra -Wno-unused-parameter \
            -fPIC \
            $(CICAP_CFLAGS) \
-           $(SURI_CFLAGS)
+           $(SURI_CFLAGS) \
+           $(CFLAGS)
 
 LDFLAGS := -shared \
            $(CICAP_LDFLAGS) \
-           $(SURI_LDFLAGS) \
-           -lpthread
+           $(SURI_LDFLAGS)
 
 # ── Targets ──────────────────────────────────────────────────────────────────
 TARGET  := srv_suricata.so

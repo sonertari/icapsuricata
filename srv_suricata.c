@@ -52,13 +52,13 @@
 #include <fcntl.h>
 
 // Adjust the include path in the Makefile if your installation places these headers differently
-#include <c-icap/c-icap.h>
-#include <c-icap/service.h>
-#include <c-icap/header.h>
-#include <c-icap/body.h>
-#include <c-icap/simple_api.h>
-#include <c-icap/debug.h>
-#include <c-icap/cfg_param.h>
+#include <c_icap/c-icap.h>
+#include <c_icap/service.h>
+#include <c_icap/header.h>
+#include <c_icap/body.h>
+#include <c_icap/simple_api.h>
+#include <c_icap/debug.h>
+#include <c_icap/cfg_param.h>
 
 // These headers are installed via `make install-headers`
 #include <suricata/suricata.h>
