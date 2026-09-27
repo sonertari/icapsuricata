@@ -94,7 +94,7 @@ sudo apt install c-icap libicapapi-dev
 
 # or build from source
 git clone https://github.com/c-icap/c-icap-server.git
-cd c-icap-server && ./configure && make && sudo make install
+cd c-icap-server && sh RECONF && ./configure && make && sudo make install
 ```
 
 ### 2 · libsuricata
@@ -186,10 +186,10 @@ Configure your upstream ICAP client (e.g. **SSLproxy**) to forward requests or r
 icap://<host>:1344/suricata
 ```
 
-For example, you can use the following ICAP specification with SSLproxy:
+For example, you can use the following ICAP specification in SSLproxy:
 
 ```text
-Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,yes,no,X-Response-Vars
+Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,16384,yes,no,X-Response-Vars
 ```
 See the [icap branch](https://github.com/sonertari/SSLproxy/tree/icap) in the SSLproxy project for details.
 
