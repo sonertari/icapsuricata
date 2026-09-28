@@ -1034,7 +1034,7 @@ static void suri_init_tcp_session(struct suri_ctx *ctx)
 {
     // Open the kernel's secure random device
     // O_CLOEXEC is a good habit to prevent descriptor leaks with fork+exec, even though we don't exec here.
-    int fd = open("/dev/urandom", O_RDONLY | __O_CLOEXEC);
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         suri_log(1, "Failed to open /dev/urandom\n");
         goto err;
@@ -1271,6 +1271,8 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
         }
     }
 out:
+    // Silence the warning: label followed by a declaration is a C23 extension
+    ;
     int result = suri_handle_inspect_result(req, rv);
 
     if (rv == 1) {
@@ -1440,6 +1442,8 @@ int suri_io(char *wbuf, int *wlen, char *rbuf, int *rlen, int iseof, ci_request_
         }
     }
 out:
+    // Silence the warning: label followed by a declaration is a C23 extension
+    ;
     int result = suri_handle_inspect_result(req, rv);
     if (result == CI_MOD_DONE && (rv == 0 || rv == -2)) {
         return CI_OK;
