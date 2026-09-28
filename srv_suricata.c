@@ -373,7 +373,11 @@ static void *SuricataWorkerThread(void *arg)
 // Minimal 40-byte raw Layer 3 / Layer 4 structure 
 // packed to ensure precise network formatting alignment.
 struct __attribute__((__packed__)) fake_pkt_hdr {
+#ifdef __linux__
     struct iphdr ip;
+#else
+    struct ip ip;
+#endif
     struct tcphdr tcp;
 };
 
@@ -597,6 +601,8 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
 
     struct fake_pkt_hdr *hdr = (struct fake_pkt_hdr *)pkt;
 
+#ifdef __linux__
+    // Linux struct iphdr and struct tcphdr field mappings
     hdr->ip.version = 4;
     hdr->ip.ihl = 5;                        /* 5 dwords = 20 bytes */
     hdr->ip.tot_len = htons(*pkt_len);
@@ -619,7 +625,40 @@ static uint8_t *CreatePacket(ci_request_t *req, const char *data, int data_len, 
         hdr->tcp.ack = flags & TH_ACK ? 1 : 0;
         hdr->tcp.psh = flags & TH_PUSH ? 1 : 0;
         hdr->tcp.fin = flags & TH_FIN ? 1 : 0;
+
         suri_log(7, "Set flags syn=%u, ack=%u, psh=%u, fin=%u\n", hdr->tcp.syn, hdr->tcp.ack, hdr->tcp.psh, hdr->tcp.fin);
+#else
+    // BSD struct ip and struct tcphdr field mappings
+    hdr->ip.ip_v = 4;
+    hdr->ip.ip_hl = 5;                        /* 5 dwords = 20 bytes */
+    hdr->ip.ip_len = htons(*pkt_len);
+    hdr->ip.ip_ttl = 64;
+    hdr->ip.ip_p = GetProto(req);
+
+    suri_log(9, "Set IP/Port, direction to %s\n", toserver ? "server" : "client");
+    hdr->ip.ip_src.s_addr = toserver ? GetClientIP(req) : GetServerIP(req);
+    hdr->ip.ip_dst.s_addr = toserver ? GetServerIP(req) : GetClientIP(req);
+
+    if (hdr->ip.ip_p == IPPROTO_TCP) {
+        // Use ICAP client port for the standard L4 tuple
+        // This allows Suricata to distinguish different h2/h3 streams.
+        hdr->tcp.th_sport = toserver ? GetIcapClientPort(req) : GetServerPort(req);
+        hdr->tcp.th_dport = toserver ? GetServerPort(req) : GetIcapClientPort(req);
+
+        hdr->tcp.th_off = 6;                  /* 6 dwords = 24 bytes (20B header + 4B option) */
+
+        // BSD TCP flag handling
+        if (flags & TH_SYN)  hdr->tcp.th_flags |= TH_SYN;
+        if (flags & TH_ACK)  hdr->tcp.th_flags |= TH_ACK;
+        if (flags & TH_PUSH) hdr->tcp.th_flags |= TH_PUSH;
+        if (flags & TH_FIN)  hdr->tcp.th_flags |= TH_FIN;
+
+        suri_log(7, "Set flags syn=%u, ack=%u, psh=%u, fin=%u\n",
+                 (hdr->tcp.th_flags & TH_SYN) ? 1 : 0,
+                 (hdr->tcp.th_flags & TH_ACK) ? 1 : 0,
+                 (hdr->tcp.th_flags & TH_PUSH) ? 1 : 0,
+                 (hdr->tcp.th_flags & TH_FIN) ? 1 : 0);
+#endif
 
         // ATTENTION: Suricata does NOT detect unless we set th_win (otherwise, flow will have error events)
         hdr->tcp.th_win = htons(65535);
