@@ -36,13 +36,13 @@ SURI_CFLAGS    := $(shell libsuricata-config --cflags 2>/dev/null)
 SURI_LDFLAGS   := $(shell libsuricata-config --libs)
 
 # ── Compiler flags ───────────────────────────────────────────────────────────
-CFLAGS  := -O2 -g -Wall -Wextra -Wno-unused-parameter \
+CUSTOMCFLAGS  := -O2 -g -Wall -Wextra -Wno-unused-parameter \
            -fPIC \
            $(CICAP_CFLAGS) \
            $(SURI_CFLAGS) \
            $(CFLAGS)
 
-LDFLAGS := -shared \
+CUSTOMLDFLAGS := -shared \
            $(CICAP_LDFLAGS) \
            $(SURI_LDFLAGS)
 
@@ -55,7 +55,7 @@ SRC     := srv_suricata.c dual_ring_buf.c
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CUSTOMCFLAGS) -o $@ $^ $(LDFLAGS) $(CUSTOMLDFLAGS)
 	@echo "Built $@"
 
 clean:
