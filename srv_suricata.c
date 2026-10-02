@@ -59,6 +59,7 @@
 #include <c_icap/simple_api.h>
 #include <c_icap/debug.h>
 #include <c_icap/cfg_param.h>
+#include <c_icap/commands.h>
 
 // These headers are installed via `make install-headers`
 #include <suricata/suricata.h>
@@ -114,8 +115,8 @@ static ThreadVars *g_worker_tv = NULL;
 // pthread_t of the dedicated worker thread (used for pthread_join in shutdown).
 static pthread_t g_worker_thread_id = 0;
 
-// Global list of lazily-created per-c-icap-thread TVs, used during shutdown to call
-// SCTmThreadsSlotPacketLoopFinish for each one from the worker thread.
+// Global list of lazily-created per-c-icap-thread TVs, used during shutdown to free
+// in suri_close_service().
 #define SURI_MAX_LAZY_TVS 128
 static ThreadVars *g_lazy_tvs[SURI_MAX_LAZY_TVS];
 static int g_lazy_tv_count = 0;
@@ -222,12 +223,12 @@ _CI_DECLARE_SERVICE(suricata_service);
 // Destruction callback triggered automatically when a c-icap worker thread terminates.
 // SCTmThreadsSlotPacketLoopFinish() is NOT called here because it requires THV_DEINIT
 // to be set first (by SuricataShutdown), and the c-icap thread may exit before or
-// after shutdown.  Instead, the worker thread (SuricataWorkerThread) calls
-// SCTmThreadsSlotPacketLoopFinish() for all lazy TVs during the shutdown sequence.
+// after shutdown.  Instead, suri_close_service() frees all lazy TVs during the 
+// shutdown sequence.
 static void ThreadVarsDestroyCallback(void *value)
 {
     (void)value;
-    // TV lifetime is managed by SuricataWorkerThread at shutdown.
+    // TV lifetime is managed by suri_close_service() at shutdown.
 }
 
 // The library runmode MUST create at least one ThreadVars here (inside SuricataInit)
@@ -236,7 +237,7 @@ static void ThreadVarsDestroyCallback(void *value)
 // time out waiting for THV_INIT_DONE on any TV registered but never spawned.
 static int SuricataRunModeSetup(void)
 {
-    suri_log(9, "ENTER\n");
+    suri_log(7, "ENTER\n");
 
     // TimeModeSetOffline: we feed synthetic packets with fabricated timestamps,
     // so we do not want the engine to complain about clock skew.
@@ -247,6 +248,8 @@ static int SuricataRunModeSetup(void)
         suri_log(1, "SCRunModeLibCreateThreadVars failed\n");
         return -1;
     }
+
+    suri_log(9, "EXIT, g_worker_tv->id=%d\n", g_worker_tv->id);
     return 0;
 }
 
@@ -292,11 +295,11 @@ static ThreadVars *GetThreadWorkerVars(void)
     ThreadVars *tv = pthread_getspecific(g_worker_tv_key);
     if (unlikely(tv == NULL)) {
         int worker_id = __sync_add_and_fetch(&g_worker_id_counter, 1);
-        suri_log(5, "Initializing thread-local ThreadVars, id=%d\n", worker_id);
+        suri_log(5, "Initializing thread-local ThreadVars, worker_id=%d\n", worker_id);
 
         tv = SCRunModeLibCreateThreadVars(worker_id);
         if (tv == NULL) {
-            suri_log(1, "Critical: SCRunModeLibCreateThreadVars failed, id=%d\n", worker_id);
+            suri_log(1, "Critical: SCRunModeLibCreateThreadVars failed, worker_id=%d\n", worker_id);
             return NULL;
         }
 
@@ -304,15 +307,16 @@ static ThreadVars *GetThreadWorkerVars(void)
         // during SuricataPostInit() so we must clear THV_PAUSE manually here.
         TmThreadContinue(tv);
 
+        // ATTENTION: SCRunModeLibSpawnWorker will not spawn the worker thread a second time 
         if (SCRunModeLibSpawnWorker(tv) != 0) {
-            suri_log(1, "Critical: SCRunModeLibSpawnWorker failed, id=%d\n", worker_id);
+            suri_log(1, "Critical: SCRunModeLibSpawnWorker failed, worker_id=%d\n", worker_id);
             return NULL;
         }
 
         pthread_setspecific(g_worker_tv_key, tv);
 
-        // Register in the global list so the worker thread can call
-        // SCTmThreadsSlotPacketLoopFinish() for each TV at shutdown.
+        // Register in the global list so suri_close_service() can free
+        // each TV at shutdown.
         pthread_mutex_lock(&g_lazy_tv_lock);
         if (g_lazy_tv_count < SURI_MAX_LAZY_TVS) {
             g_lazy_tvs[g_lazy_tv_count++] = tv;
@@ -320,6 +324,7 @@ static ThreadVars *GetThreadWorkerVars(void)
             suri_log(1, "SURI_MAX_LAZY_TVS (%d) exceeded; increase the limit\n", SURI_MAX_LAZY_TVS);
         }
         pthread_mutex_unlock(&g_lazy_tv_lock);
+        suri_log(5, "EXIT, worker_id=%d, tv->id=%d\n", worker_id, tv->id);
     }
     return tv;
 }
@@ -327,16 +332,12 @@ static ThreadVars *GetThreadWorkerVars(void)
 // Dedicated worker thread: spawns the bootstrap TV (blocks in TmThreadsWaitForUnpause
 // until SuricataPostInit calls TmThreadContinueThreads), then drives SuricataMainLoop.
 //
-// At shutdown SuricataMainLoop() returns (EngineStop() set SURICATA_STOP), then this
-// thread calls SCTmThreadsSlotPacketLoopFinish() for the bootstrap TV *and* for every
-// lazily-created per-c-icap-thread TV.  These calls MUST run concurrently with
-// SuricataShutdown() in suri_close_service (that is the locking protocol required by
-// Suricata's thread-manager).
+// At shutdown SuricataMainLoop() returns (EngineStop() set SURICATA_STOP).
 static void *SuricataWorkerThread(void *arg)
 {
     (void)arg;
 
-    suri_log(9, "ENTER\n");
+    suri_log(5, "ENTER, start main worker thread, g_worker_tv->id=%d\n", g_worker_tv->id);
 
     // g_worker_tv was created in SuricataRunModeSetup (during SuricataInit).
     // It is already registered in tv_root so TmThreadWaitOnThreadInit can find it.
@@ -349,22 +350,24 @@ static void *SuricataWorkerThread(void *arg)
     SuricataMainLoop();
 
     // --- Shutdown path ---
-    // SuricataShutdown() in suri_close_service sets THV_DEINIT on every TV;
-    // SCTmThreadsSlotPacketLoopFinish() waits for THV_DEINIT then sets THV_CLOSED.
-    // Both must run concurrently.
+    // ATTENTION: We don't call SCTmThreadsSlotPacketLoopFinish for either the bootstrap TV
+    // or the lazily-created TVs. Nor do we call SuricataShutdown() here.
 
-    suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for bootstrap TV\n");
-    SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
+    // suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for bootstrap TV, g_worker_tv->id=%d\n", g_worker_tv->id);
+    // SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
 
     // Also finish all lazily-created per-c-icap-thread TVs.
-    pthread_mutex_lock(&g_lazy_tv_lock);
-    int count = g_lazy_tv_count;
-    pthread_mutex_unlock(&g_lazy_tv_lock);
+    // pthread_mutex_lock(&g_lazy_tv_lock);
+    // int count = g_lazy_tv_count;
+    // pthread_mutex_unlock(&g_lazy_tv_lock);
 
-    for (int i = 0; i < count; i++) {
-        suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for lazy TV %d\n", i);
-        SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
-    }
+    // for (int i = 0; i < count; i++) {
+    //     suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for lazy TV %d\n", i);
+    //     SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
+    // }
+
+    // suri_log(7, "SuricataShutdown()\n");
+    // SuricataShutdown();
 
     suri_log(5, "EXIT\n");
     pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
@@ -773,8 +776,8 @@ static int InjectPacket(ci_request_t *req, const char *data, int data_len, uint1
 
     LiveDevicePktsIncr(GetLiveDevice(req));
 
-    // Recycle and release the processed node wrapper frame cleanly back into the queue pool
-    TmqhOutputPacketpool(my_tv, p);
+    // ATTENTION: Do not recycle the packet with thread-local TVs, it will be handled by the Suricata engine
+    // TmqhOutputPacketpool(my_tv, p);
     return rv;
 }
 
@@ -807,19 +810,68 @@ static void suri_cfg_set(ci_service_xdata_t *srv_xdata)
     }
 }
 
+
+/* Module-level static variables (private per child process post-fork) */
+// static pthread_once_t suri_child_once = PTHREAD_ONCE_INIT;
+static int suri_init_status = CI_ERROR;
+
+/* Callback executed by c-icap inside commands_execute_stop_child() */
+static void suri_child_start_cmd_cb(const char *name, int type, void *data)
+{
+    pid_t current_pid = getpid();
+
+    /* Initialize Suricata library and spin up threads here */
+    suri_log(5, "Initializing Suricata inside child process (PID: %d)\n", current_pid);
+
+    // Set up a thread-local key configuration block before priming any threads
+    if (pthread_key_create(&g_worker_tv_key, ThreadVarsDestroyCallback) != 0) {
+        suri_log(1, "Critical Error: Failed to configure pthread TLS storage key variables.\n");
+        return;
+    }
+
+    suri_log(7, "SuricataInit() (PID: %d)\n", current_pid);
+    SuricataInit();
+
+    SCDetectEngineRegisterRateFilterCallback(RateFilterCallback, NULL);
+
+    // Start the dedicated worker thread BEFORE SuricataPostInit.
+    // The worker calls SCRunModeLibSpawnWorker(g_worker_tv) which blocks inside
+    // TmThreadsWaitForUnpause until SuricataPostInit -> TmThreadContinueThreads
+    // clears THV_PAUSE.  Do NOT call GetThreadWorkerVars() here (init thread) --
+    // that would register an extra TV that never gets SCRunModeLibSpawnWorker
+    // called on it, causing TmThreadWaitOnThreadInit to time out after 120s.
+    if (pthread_create(&g_worker_thread_id, NULL, SuricataWorkerThread, NULL) != 0) {
+        suri_log(1, "pthread_create for worker failed, failed to initialize Suricata\n");
+        return;
+    }
+
+    // Post-init seals threads, starts packet queues, etc.
+    suri_log(7, "SuricataPostInit() (PID: %d)\n", current_pid);
+    SuricataPostInit();
+
+    suri_log(5, "Suricata engine ready (PID: %d)\n", current_pid);
+    g_suri_ready = 1;
+
+    suri_init_status = CI_OK;
+}
+
 // Called once when the module is loaded
 int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf)
+{
+    // We init Suricata in post-init service function, so nothing else to do here
+    suri_log(5, "ENTER, register suri_child_start command\n");
+
+    /* Register the start command handler with c-icap for child processes */
+    ci_command_register_action("suri_child_start", CI_CMD_CHILD_START, NULL, suri_child_start_cmd_cb);
+    return CI_OK;
+}
+
+int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf *server_conf)
 {
     suri_log(5, "Initialise Suricata library in thread-safe parallel mode\n");
 
     // Seed the generator for tcp seq numbers
     srandom(time(NULL));
-
-    // Set up a thread-local key configuration block before priming any threads
-    if (pthread_key_create(&g_worker_tv_key, ThreadVarsDestroyCallback) != 0) {
-        suri_log(1, "Critical Error: Failed to configure pthread TLS storage key variables.\n");
-        return CI_ERROR;
-    }
 
     // SuricataPreInit must be the very first call.  We pass the service name
     // as argv[0] equivalent so Suricata can locate its own binary path.
@@ -855,48 +907,20 @@ int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *serv
         return CI_ERROR;
     }
 
-    SCEnableDefaultSignalHandlers();
+    // Do not intercept c-icap signals
+    // SCEnableDefaultSignalHandlers();
 
     // Load the config from file
     if (SCLoadYamlConfig() != TM_ECODE_OK) {
         exit(EXIT_FAILURE);
     }
 
-    // Initialise the engine, calls SuricataRunModeSetup callback
-    SuricataInit();
-
-    SCDetectEngineRegisterRateFilterCallback(RateFilterCallback, NULL);
-
-    // Start the dedicated worker thread BEFORE SuricataPostInit.
-    // The worker calls SCRunModeLibSpawnWorker(g_worker_tv) which blocks inside
-    // TmThreadsWaitForUnpause until SuricataPostInit -> TmThreadContinueThreads
-    // clears THV_PAUSE.  Do NOT call GetThreadWorkerVars() here (init thread) --
-    // that would register an extra TV that never gets SCRunModeLibSpawnWorker
-    // called on it, causing TmThreadWaitOnThreadInit to time out after 120s.
-    if (pthread_create(&g_worker_thread_id, NULL, SuricataWorkerThread, NULL) != 0) {
-       suri_log(1, "pthread_create for worker failed\n");
-       return CI_ERROR;
-    }
-
-    // Post-init seals threads, starts packet queues, etc.
-    SuricataPostInit();
-
     // Record the exact PID that initialized the engine,
-    // so we can conditionally bypass shutdown in child processes.
+    // so we can conditionally stop engine in child processes.
     g_parent_pid = getpid();
 
     suri_cfg_set(srv_xdata);
-
-    suri_log(5, "Suricata engine ready\n");
-    g_suri_ready = 1;
-
-    return CI_OK;
-}
-
-int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf *server_conf)
-{
-    // Set config again, with possibly updated values
-    suri_cfg_set(srv_xdata);
+    suri_log(7, "EXIT\n");
     return CI_OK;
 }
 
@@ -906,43 +930,118 @@ void suri_close_service(void)
     pid_t current_pid = getpid();
     suri_log(5, "ENTER, g_suri_ready=%d, g_parent_pid=%d, current_pid=%d\n", g_suri_ready, g_parent_pid, current_pid);
 
+    if (current_pid == g_parent_pid) {
+        // ATTENTION: We don't call EngineStop() for parent, as parent does not have a worker loop.
+        // suri_log(7, "EngineStop()\n");
+        // EngineStop();                             /* Tell worker loop to stop */
+
+        // ATTENTION: We don't call SuricataShutdown() here, parent never calls SuricataPostInit().
+        // Otherwise, SuricataShutdown() hangs.
+        // suri_log(7, "SuricataShutdown()\n");
+        // SuricataShutdown();
+
+        // ATTENTION: We don't call GlobalsDestroy() for parent, as parent does not call SuricataInit().
+        // suri_log(7, "GlobalsDestroy()\n");
+        // GlobalsDestroy();
+
+        suri_log(5, "Parent shutdown complete, current_pid=%d\n", current_pid);
+
+        // ATTENTION: Never use _exit() here, otherwise the other services managed by c-icap may not get a chance to clean up properly.
+        // _exit(0);
+        return;
+    }
+
     if (!g_suri_ready) {
+        suri_log(7, "Suricata not ready in child process, skipping shutdown, current_pid=%d\n", current_pid);
         return;
     }
     g_suri_ready = 0;
 
     // ATTENTION: Only tear down threads and force exit if we are running 
     // inside the specific process context that initialized them.
-    if (current_pid == g_parent_pid) {
+    suri_log(7, "Suricata shutdown in child process, current_pid=%d\n", current_pid);
+
+    if (g_worker_thread_id > 0) {
         suri_log(7, "EngineStop()\n");
-        EngineStop();
+        EngineStop();                             /* Tell worker loop to stop */
 
-        // SuricataShutdown() sets THV_DEINIT on every TV and waits for THV_CLOSED.
-        // The worker thread concurrently calls SCTmThreadsSlotPacketLoopFinish() for
-        // the bootstrap TV and all lazy TVs, which sets THV_CLOSED on each.
-        // pthread_join ensures the worker has finished before we call GlobalsDestroy.
-        suri_log(7, "SuricataShutdown()\n");
-        SuricataShutdown();
+        // ATTENTION: We don't call SuricataShutdown() here, as EngineStop() is enough for a clean shutdown.
+        // Otherwise, SuricataShutdown() hangs.
+        // suri_log(7, "SuricataShutdown()\n");
+        // SuricataShutdown();
 
-        suri_log(7, "pthread_join()\n");
+        // ATTENTION: We don't call SCTmThreadsSlotPacketLoopFinish() here for bootstrap or lazy TVs.
+        // suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for bootstrap TV\n");
+        // SCTmThreadsSlotPacketLoopFinish(g_worker_tv);
+        // for (int i = 0; i < count; i++) {
+        //     suri_log(5, "SCTmThreadsSlotPacketLoopFinish() for lazy TV %d, g_lazy_tvs[i]->id=%d\n", i, g_lazy_tvs[i]->id);
+        //     SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
+        // }
+
+        // ATTENTION: We kill/join Suricata management threads, otherwise c-icap segfaults
+        /* Traverse ALL linked lists across all TVT types */
+        for (int i = 0; i < TVT_MAX; i++) {
+            ThreadVars *tv = tv_root[i];
+            while (tv != NULL) {
+                /* Store next pointer before canceling/joining, as joining may free tv */
+                ThreadVars *next_tv = tv->next;
+
+                if (tv->t != 0 && !pthread_equal(tv->t, pthread_self())) {
+                    suri_log(7, "Child canceling Suricata thread [%s] (ID: %lu)\n", tv->name, (unsigned long)tv->t);
+
+                    /* Force pthread to cancel immediately */
+                    pthread_cancel(tv->t);
+
+                    /* Wait for thread to actually terminate */
+                    pthread_join(tv->t, NULL);
+                }
+
+                tv = next_tv;
+            }
+        }
+
+        // Also free all lazily-created per-c-icap-thread TVs.
+        pthread_mutex_lock(&g_lazy_tv_lock);
+        int count = g_lazy_tv_count;
+
+        for (int i = 0; i < count; i++) {
+            if (g_lazy_tvs[i] != NULL) {
+                suri_log(7, "Child freeing lazy TV [%s] (ID: %lu)\n", g_lazy_tvs[i]->name, (unsigned long)g_lazy_tvs[i]->t);
+                ThreadVarsFree(g_lazy_tvs[i]);
+                g_lazy_tvs[i] = NULL;
+            }
+        }
+        g_lazy_tv_count = 0;
+        pthread_mutex_unlock(&g_lazy_tv_lock);
+
+#ifdef __linux__
+        pid_t tid = syscall(SYS_gettid);
+#else
+        pid_t tid = getthrid();
+#endif
+        // The pthread_join here ensures the worker has finished before we return.
+        suri_log(7, "Child joining worker thread, g_worker_thread_id=%llu, tid=%d\n", (unsigned long long)g_worker_thread_id, tid);
         pthread_join(g_worker_thread_id, NULL);
 
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
 
-        // Exterminate the thread variable tracking key layout allocation block
-        pthread_key_delete(g_worker_tv_key);
-
-        suri_log(5, "Shutdown complete, current_pid=%d\n", current_pid);
-    }
-    else {
-        suri_log(7, "Bypass Suricata shutdown in child process, current_pid=%d\n", current_pid);
+        suri_log(5, "Child shutdown complete, current_pid=%d\n", current_pid);
+        return;
+    } else {
+        suri_log(7, "Child has no worker thread to join\n");
+        return;
     }
 }
 
 void *suri_init_request_data(ci_request_t *req)
 {
     suri_log(1, "ENTER\n");
+
+    if (suri_init_status != CI_OK) {
+        suri_log(1, "Suricata not initialized (PID: %d)\n", getpid());
+        return NULL;
+    }
 
     struct suri_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
