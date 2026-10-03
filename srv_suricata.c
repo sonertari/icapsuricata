@@ -810,12 +810,7 @@ static void suri_cfg_set(ci_service_xdata_t *srv_xdata)
     }
 }
 
-
-/* Module-level static variables (private per child process post-fork) */
-// static pthread_once_t suri_child_once = PTHREAD_ONCE_INIT;
-static int suri_init_status = CI_ERROR;
-
-/* Callback executed by c-icap inside commands_execute_stop_child() */
+/* Callback executed by c-icap inside commands_execute_start_child() */
 static void suri_child_start_cmd_cb(const char *name, int type, void *data)
 {
     pid_t current_pid = getpid();
@@ -851,18 +846,13 @@ static void suri_child_start_cmd_cb(const char *name, int type, void *data)
 
     suri_log(5, "Suricata engine ready (PID: %d)\n", current_pid);
     g_suri_ready = 1;
-
-    suri_init_status = CI_OK;
 }
 
 // Called once when the module is loaded
 int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf)
 {
-    // We init Suricata in post-init service function, so nothing else to do here
-    suri_log(5, "ENTER, register suri_child_start command\n");
-
-    /* Register the start command handler with c-icap for child processes */
-    ci_command_register_action("suri_child_start", CI_CMD_CHILD_START, NULL, suri_child_start_cmd_cb);
+    // We init Suricata in post-init service function, so nothing to do here
+    suri_log(5, "ENTER\n");
     return CI_OK;
 }
 
@@ -919,7 +909,15 @@ int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf
     // so we can conditionally stop engine in child processes.
     g_parent_pid = getpid();
 
+    // Set config again, with possibly updated values
+    // Note that suri_cfg_set is specified in ci_service_module_t,
+    // hence is called first during service init
     suri_cfg_set(srv_xdata);
+
+    // Register the start command handler with c-icap for child processes to init Suricata
+    suri_log(5, "Register suri_child_start command\n");
+    ci_command_register_action("suri_child_start", CI_CMD_CHILD_START, NULL, suri_child_start_cmd_cb);
+
     suri_log(7, "EXIT\n");
     return CI_OK;
 }
@@ -1038,7 +1036,7 @@ void *suri_init_request_data(ci_request_t *req)
 {
     suri_log(1, "ENTER\n");
 
-    if (suri_init_status != CI_OK) {
+    if (!g_suri_ready) {
         suri_log(1, "Suricata not initialized (PID: %d)\n", getpid());
         return NULL;
     }
