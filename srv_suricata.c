@@ -329,6 +329,66 @@ static ThreadVars *GetThreadWorkerVars(void)
     return tv;
 }
 
+static void suri_unlink_tv_from_root(ThreadVars *tv_to_remove)
+{
+    if (tv_to_remove == NULL) return;
+
+    int type = tv_to_remove->type;
+    if (type < 0 || type >= TVT_MAX) return;
+
+    ThreadVars *curr = tv_root[type];
+    ThreadVars *prev = NULL;
+
+    while (curr != NULL) {
+        if (curr == tv_to_remove) {
+            if (prev == NULL) {
+                /* Node to remove is the head of the list */
+                tv_root[type] = curr->next;
+            } else {
+                /* Node to remove is in the middle or end */
+                prev->next = curr->next;
+            }
+            curr->next = NULL;
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+}
+
+static void suri_free_tv(ThreadVars *tv)
+{
+    if (tv == NULL) return;
+
+    TmSlot *s = tv->tm_slots;
+
+    /* Flush local counters to global stats */
+    StatsSyncCounters(tv);
+
+    /* Run thread slot deinitialization (frees detection engine contexts, 
+       thread-local caches, packet pools) without touching flow loops */
+    PacketPoolDestroy();
+
+    for (TmSlot *slot = s; slot != NULL; slot = slot->slot_next) {
+        if (slot->SlotThreadExitPrintStats != NULL) {
+            slot->SlotThreadExitPrintStats(tv, SC_ATOMIC_GET(slot->slot_data));
+        }
+        if (slot->SlotThreadDeinit != NULL) {
+            slot->SlotThreadDeinit(tv, SC_ATOMIC_GET(slot->slot_data));
+        }
+    }
+
+    tv->stream_pq = NULL;
+    TmThreadsSetFlag(tv, THV_CLOSED);
+
+    TmThreadsUnregisterThread(tv->id);
+
+    /* CRITICAL: Forcibly unlink TV from tv_root BEFORE freeing memory */
+    suri_unlink_tv_from_root(tv);
+
+    ThreadVarsFree(tv);
+}
+
 // Dedicated worker thread: spawns the bootstrap TV (blocks in TmThreadsWaitForUnpause
 // until SuricataPostInit calls TmThreadContinueThreads), then drives SuricataMainLoop.
 //
@@ -368,6 +428,11 @@ static void *SuricataWorkerThread(void *arg)
 
     // suri_log(7, "SuricataShutdown()\n");
     // SuricataShutdown();
+
+    // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
+    suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
+    suri_free_tv(g_worker_tv);
+    g_worker_tv = NULL;
 
     suri_log(5, "EXIT\n");
     pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
@@ -818,6 +883,51 @@ static void suri_child_start_cmd_cb(const char *name, int type, void *data)
     /* Initialize Suricata library and spin up threads here */
     suri_log(5, "Initializing Suricata inside child process (PID: %d)\n", current_pid);
 
+    // Seed the generator for tcp seq numbers
+    srandom(time(NULL));
+
+    // SuricataPreInit must be the very first call.  We pass the service name
+    // as argv[0] equivalent so Suricata can locate its own binary path.
+    SuricataPreInit("srv_suricata");
+
+    // Offline/library mode, no live capture device required
+    SCRunmodeSet(RUNMODE_LIB);
+
+    // Finalize runmode selection, required before SuricataInit
+    if (SCFinalizeRunMode() != TM_ECODE_OK) {
+        suri_log(1, "SCFinalizeRunMode failed\n");
+        return;
+    }
+
+    // Register a virtual loopback "live" device for packets to be associated with
+    if (LiveRegisterDevice("suri_icap0") < 0) {
+        suri_log(1, "LiveRegisterDevice failed\n");
+        return;
+    }
+
+    // Register our custom runmode with its setup callback
+    RunModeRegisterNewRunMode(
+        RUNMODE_LIB,
+        "icap",
+        "c-icap ICAP inspection runmode",
+        SuricataRunModeSetup,
+        NULL /* TODO: Need teardown callback */
+    );
+
+    // Tell Suricata to use our custom runmode
+    if (!SCConfSet("runmode", "icap")) {
+        suri_log(1, "SCConfSet runmode failed\n");
+        return;
+    }
+
+    // Do not intercept c-icap signals
+    // SCEnableDefaultSignalHandlers();
+
+    // Load the config from file
+    if (SCLoadYamlConfig() != TM_ECODE_OK) {
+        exit(EXIT_FAILURE);
+    }
+
     // Set up a thread-local key configuration block before priming any threads
     if (pthread_key_create(&g_worker_tv_key, ThreadVarsDestroyCallback) != 0) {
         suri_log(1, "Critical Error: Failed to configure pthread TLS storage key variables.\n");
@@ -851,59 +961,15 @@ static void suri_child_start_cmd_cb(const char *name, int type, void *data)
 // Called once when the module is loaded
 int suri_init_service(ci_service_xdata_t *srv_xdata, struct ci_server_conf *server_conf)
 {
-    // We init Suricata in post-init service function, so nothing to do here
+    // We init Suricata in suri_child_start_cmd_cb, so nothing to do here
     suri_log(5, "ENTER\n");
     return CI_OK;
 }
 
 int suri_post_init_service(ci_service_xdata_t * srv_xdata, struct ci_server_conf *server_conf)
 {
-    suri_log(5, "Initialise Suricata library in thread-safe parallel mode\n");
-
-    // Seed the generator for tcp seq numbers
-    srandom(time(NULL));
-
-    // SuricataPreInit must be the very first call.  We pass the service name
-    // as argv[0] equivalent so Suricata can locate its own binary path.
-    SuricataPreInit("srv_suricata");
-
-    // Offline/library mode, no live capture device required
-    SCRunmodeSet(RUNMODE_LIB);
-
-    // Finalize runmode selection, required before SuricataInit
-    if (SCFinalizeRunMode() != TM_ECODE_OK) {
-        suri_log(1, "SCFinalizeRunMode failed\n");
-        return CI_ERROR;
-    }
-
-    // Register a virtual loopback "live" device for packets to be associated with
-    if (LiveRegisterDevice("suri_icap0") < 0) {
-        suri_log(1, "LiveRegisterDevice failed\n");
-        return CI_ERROR;
-    }
-
-    // Register our custom runmode with its setup callback
-    RunModeRegisterNewRunMode(
-        RUNMODE_LIB,
-        "icap",
-        "c-icap ICAP inspection runmode",
-        SuricataRunModeSetup,
-        NULL /* TODO: Need teardown callback */
-    );
-
-    // Tell Suricata to use our custom runmode
-    if (!SCConfSet("runmode", "icap")) {
-        suri_log(1, "SCConfSet runmode failed\n");
-        return CI_ERROR;
-    }
-
-    // Do not intercept c-icap signals
-    // SCEnableDefaultSignalHandlers();
-
-    // Load the config from file
-    if (SCLoadYamlConfig() != TM_ECODE_OK) {
-        exit(EXIT_FAILURE);
-    }
+    // We init Suricata in suri_child_start_cmd_cb, so nothing else to do here
+    suri_log(5, "ENTER\n");
 
     // Record the exact PID that initialized the engine,
     // so we can conditionally stop engine in child processes.
@@ -976,6 +1042,18 @@ void suri_close_service(void)
         //     SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
         // }
 
+        /* Clean up and UNLINK all lazy TVs */
+        pthread_mutex_lock(&g_lazy_tv_lock);
+        for (int i = 0; i < g_lazy_tv_count; i++) {
+            if (g_lazy_tvs[i] != NULL) {
+                suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
+                suri_free_tv(g_lazy_tvs[i]);
+                g_lazy_tvs[i] = NULL;
+            }
+        }
+        g_lazy_tv_count = 0;
+        pthread_mutex_unlock(&g_lazy_tv_lock);
+
         // ATTENTION: We kill/join Suricata management threads, otherwise c-icap segfaults
         /* Traverse ALL linked lists across all TVT types */
         for (int i = 0; i < TVT_MAX; i++) {
@@ -984,33 +1062,30 @@ void suri_close_service(void)
                 /* Store next pointer before canceling/joining, as joining may free tv */
                 ThreadVars *next_tv = tv->next;
 
-                if (tv->t != 0 && !pthread_equal(tv->t, pthread_self())) {
-                    suri_log(7, "Child canceling Suricata thread [%s] (ID: %lu)\n", tv->name, (unsigned long)tv->t);
+                if (tv->t != 0) {
+                    if (!pthread_equal(tv->t, pthread_self())) {
+                        suri_log(7, "Child canceling Suricata thread [%s, %d, %d] (ID: %lu)\n",
+                            tv->name, tv->id, tv->type, (unsigned long)tv->t);
 
-                    /* Force pthread to cancel immediately */
-                    pthread_cancel(tv->t);
+                        /* Force pthread to cancel immediately */
+                        pthread_cancel(tv->t);
 
-                    /* Wait for thread to actually terminate */
-                    pthread_join(tv->t, NULL);
+                        /* Wait for thread to actually terminate */
+                        pthread_join(tv->t, NULL);
+                    }
+                    else {
+                        suri_log(7, "Child skipping cancellation of (self) thread [%s, %d, %d] (ID: %lu)\n",
+                            tv->name, tv->id, tv->type, (unsigned long)tv->t);
+                    }
+                }
+                else {
+                    suri_log(7, "Child skipping cancellation of (no thread) thread [%s, %d, %d] (ID: %lu)\n",
+                        tv->name, tv->id, tv->type, (unsigned long)tv->t);
                 }
 
                 tv = next_tv;
             }
         }
-
-        // Also free all lazily-created per-c-icap-thread TVs.
-        pthread_mutex_lock(&g_lazy_tv_lock);
-        int count = g_lazy_tv_count;
-
-        for (int i = 0; i < count; i++) {
-            if (g_lazy_tvs[i] != NULL) {
-                suri_log(7, "Child freeing lazy TV [%s] (ID: %lu)\n", g_lazy_tvs[i]->name, (unsigned long)g_lazy_tvs[i]->t);
-                ThreadVarsFree(g_lazy_tvs[i]);
-                g_lazy_tvs[i] = NULL;
-            }
-        }
-        g_lazy_tv_count = 0;
-        pthread_mutex_unlock(&g_lazy_tv_lock);
 
 #ifdef __linux__
         pid_t tid = syscall(SYS_gettid);
@@ -1025,10 +1100,8 @@ void suri_close_service(void)
         GlobalsDestroy();
 
         suri_log(5, "Child shutdown complete, current_pid=%d\n", current_pid);
-        return;
     } else {
         suri_log(7, "Child has no worker thread to join\n");
-        return;
     }
 }
 
