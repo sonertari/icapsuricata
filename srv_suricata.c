@@ -429,10 +429,11 @@ static void *SuricataWorkerThread(void *arg)
     // suri_log(7, "SuricataShutdown()\n");
     // SuricataShutdown();
 
+    // ATTENTION: Do not free the bootstrap TV here, otherwise pthread_exit() may hang on OpenBSD.
     // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
-    suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
-    suri_free_tv(g_worker_tv);
-    g_worker_tv = NULL;
+    // suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
+    // suri_free_tv(g_worker_tv);
+    // g_worker_tv = NULL;
 
     suri_log(5, "EXIT\n");
     pthread_exit((void *)(intptr_t)EXIT_SUCCESS);
@@ -1095,6 +1096,11 @@ void suri_close_service(void)
         // The pthread_join here ensures the worker has finished before we return.
         suri_log(7, "Child joining worker thread, g_worker_thread_id=%llu, tid=%d\n", (unsigned long long)g_worker_thread_id, tid);
         pthread_join(g_worker_thread_id, NULL);
+
+        // Clean up and UNLINK the bootstrap TV (g_worker_tv / W#01)
+        suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
+        suri_free_tv(g_worker_tv);
+        g_worker_tv = NULL;
 
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
