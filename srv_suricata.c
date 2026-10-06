@@ -384,7 +384,9 @@ static void suri_free_tv(ThreadVars *tv)
     TmThreadsUnregisterThread(tv->id);
 
     /* CRITICAL: Forcibly unlink TV from tv_root BEFORE freeing memory */
+    SCMutexLock(&tv_root_lock);
     suri_unlink_tv_from_root(tv);
+    SCMutexUnlock(&tv_root_lock);
 
     ThreadVarsFree(tv);
 }
@@ -1057,6 +1059,7 @@ void suri_close_service(void)
 
         // ATTENTION: We kill/join Suricata management threads, otherwise c-icap segfaults
         /* Traverse ALL linked lists across all TVT types */
+        SCMutexLock(&tv_root_lock);
         for (int i = 0; i < TVT_MAX; i++) {
             ThreadVars *tv = tv_root[i];
             while (tv != NULL) {
@@ -1087,6 +1090,7 @@ void suri_close_service(void)
                 tv = next_tv;
             }
         }
+        SCMutexUnlock(&tv_root_lock);
 
 #ifdef __linux__
         pid_t tid = syscall(SYS_gettid);
