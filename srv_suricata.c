@@ -408,8 +408,20 @@ static void *SuricataWorkerThread(void *arg)
         pthread_exit((void *)(intptr_t)EXIT_FAILURE);
     }
 
-    suri_log(5, "SuricataMainLoop()\n");
-    SuricataMainLoop();
+    // suri_log(5, "SuricataMainLoop()\n");
+    // SuricataMainLoop();
+
+    suri_log(5, "Wait for SURICATA_STOP\n");
+    while(1) {
+        if (suricata_ctl_flags & SURICATA_STOP) {
+            suri_log(5, "Signal Received.  Stopping engine.\n");
+            break;
+        }
+
+        TmThreadCheckThreadState();
+
+        usleep(10* 1000);
+    }
 
     // --- Shutdown path ---
     // ATTENTION: We don't call SCTmThreadsSlotPacketLoopFinish for either the bootstrap TV
