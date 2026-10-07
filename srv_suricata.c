@@ -392,9 +392,13 @@ static void suri_free_tv(ThreadVars *tv)
 }
 
 // Dedicated worker thread: spawns the bootstrap TV (blocks in TmThreadsWaitForUnpause
-// until SuricataPostInit calls TmThreadContinueThreads), then drives SuricataMainLoop.
+// until SuricataPostInit calls TmThreadContinueThreads), then exits immediately.
+
+// By letting SuricataWorkerThread enter and exit immediately, we give Suricata the 
+// lifecycle event it was waiting for during initialization, while avoiding a long-running, 
+// non-essential thread that needs complex signal handling or blocking loops.
 //
-// At shutdown SuricataMainLoop() returns (EngineStop() set SURICATA_STOP).
+// At shutdown child process joins this thread on exit.
 static void *SuricataWorkerThread(void *arg)
 {
     (void)arg;
@@ -408,20 +412,21 @@ static void *SuricataWorkerThread(void *arg)
         pthread_exit((void *)(intptr_t)EXIT_FAILURE);
     }
 
+    // ATTENTION: We don't loop here; the worker thread exits immediately after initialization.
     // suri_log(5, "SuricataMainLoop()\n");
     // SuricataMainLoop();
 
-    suri_log(5, "Wait for SURICATA_STOP\n");
-    while(1) {
-        if (suricata_ctl_flags & SURICATA_STOP) {
-            suri_log(5, "Signal Received.  Stopping engine.\n");
-            break;
-        }
+    // suri_log(5, "Wait for SURICATA_STOP\n");
+    // while(1) {
+    //     if (suricata_ctl_flags & SURICATA_STOP) {
+    //         suri_log(5, "SURICATA_STOP flag raised, returning\n");
+    //         break;
+    //     }
 
-        TmThreadCheckThreadState();
+    //     TmThreadCheckThreadState();
 
-        usleep(10* 1000);
-    }
+    //     usleep(10* 1000);
+    // }
 
     // --- Shutdown path ---
     // ATTENTION: We don't call SCTmThreadsSlotPacketLoopFinish for either the bootstrap TV
