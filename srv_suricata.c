@@ -1062,52 +1062,65 @@ void suri_close_service(void)
         //     SCTmThreadsSlotPacketLoopFinish(g_lazy_tvs[i]);
         // }
 
-        /* Clean up and UNLINK all lazy TVs */
-        pthread_mutex_lock(&g_lazy_tv_lock);
-        for (int i = 0; i < g_lazy_tv_count; i++) {
-            if (g_lazy_tvs[i] != NULL) {
-                suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
-                suri_free_tv(g_lazy_tvs[i]);
-                g_lazy_tvs[i] = NULL;
-            }
-        }
-        g_lazy_tv_count = 0;
-        pthread_mutex_unlock(&g_lazy_tv_lock);
+        /* Structure for dynamic thread collection */
+        struct suri_thread_node {
+            pthread_t t;
+            char name[16];
+            struct suri_thread_node *next;
+        };
 
-        // ATTENTION: We kill/join Suricata management threads, otherwise c-icap segfaults
-        /* Traverse ALL linked lists across all TVT types */
+        struct suri_thread_node *targets_head = NULL;
+        struct suri_thread_node **targets_tail = &targets_head;
+
+        /* PASS 1: Signal threads cooperatively & collect handles (UNDER LOCK) */
         SCMutexLock(&tv_root_lock);
         for (int i = 0; i < TVT_MAX; i++) {
             ThreadVars *tv = tv_root[i];
             while (tv != NULL) {
-                /* Store next pointer before canceling/joining, as joining may free tv */
-                ThreadVars *next_tv = tv->next;
+                if (tv->t != 0 && !pthread_equal(tv->t, pthread_self())) {
+                    /* Dynamically append thread handle to collection list */
+                    struct suri_thread_node *node = malloc(sizeof(struct suri_thread_node));
+                    if (node != NULL) {
+                        node->t = tv->t;
+                        memcpy(node->name, tv->name, sizeof(node->name));
+                        node->next = NULL;
 
-                if (tv->t != 0) {
-                    if (!pthread_equal(tv->t, pthread_self())) {
-                        suri_log(7, "Child canceling Suricata thread [%s, %d, %d] (ID: %lu)\n",
-                            tv->name, tv->id, tv->type, (unsigned long)tv->t);
-
-                        /* Force pthread to cancel immediately */
-                        pthread_cancel(tv->t);
-
-                        /* Wait for thread to actually terminate */
-                        pthread_join(tv->t, NULL);
+                        *targets_tail = node;
+                        targets_tail = &node->next;
                     }
-                    else {
-                        suri_log(7, "Child skipping cancellation of (self) thread [%s, %d, %d] (ID: %lu)\n",
-                            tv->name, tv->id, tv->type, (unsigned long)tv->t);
+
+                    /* Set Suricata's cooperative kill flag */
+                    TmThreadsSetFlag(tv, THV_KILL);
+
+                    /* Wake up thread from ctrl condition wait */
+                    if (tv->ctrl_mutex != NULL && tv->ctrl_cond != NULL) {
+                        SCCtrlMutexLock(tv->ctrl_mutex);
+                        pthread_cond_broadcast(tv->ctrl_cond);
+                        SCCtrlMutexUnlock(tv->ctrl_mutex);
                     }
                 }
-                else {
-                    suri_log(7, "Child skipping cancellation of (no thread) thread [%s, %d, %d] (ID: %lu)\n",
-                        tv->name, tv->id, tv->type, (unsigned long)tv->t);
-                }
-
-                tv = next_tv;
+                tv = tv->next;
             }
         }
         SCMutexUnlock(&tv_root_lock);
+
+        /* PASS 2: Cancel & Join collected threads (WITHOUT LOCK) */
+        struct suri_thread_node *tv = targets_head;
+        while (tv != NULL) {
+            struct suri_thread_node *next = tv->next;
+
+            suri_log(7, "Child canceling/joining Suricata thread [%s] (ID: %lu)\n", tv->name, (unsigned long)tv->t);
+
+            /* Force cancellation as a fallback if cooperative exit hasn't finished */
+            pthread_cancel(tv->t);
+
+            /* Join safely without holding tv_root_lock */
+            pthread_join(tv->t, NULL);
+
+            free(tv);
+            tv = next;
+        }
+        targets_head = NULL;
 
 #ifdef __linux__
         pid_t tid = syscall(SYS_gettid);
@@ -1122,6 +1135,18 @@ void suri_close_service(void)
         suri_log(7, "Unlink and free bootstrap TV [%s]\n", g_worker_tv->name);
         suri_free_tv(g_worker_tv);
         g_worker_tv = NULL;
+
+        // Clean up and UNLINK all lazy TVs
+        pthread_mutex_lock(&g_lazy_tv_lock);
+        for (int i = 0; i < g_lazy_tv_count; i++) {
+            if (g_lazy_tvs[i] != NULL) {
+                suri_log(7, "Child unlinking and freeing lazy TV [%s]\n", g_lazy_tvs[i]->name);
+                suri_free_tv(g_lazy_tvs[i]);
+                g_lazy_tvs[i] = NULL;
+            }
+        }
+        g_lazy_tv_count = 0;
+        pthread_mutex_unlock(&g_lazy_tv_lock);
 
         suri_log(7, "GlobalsDestroy()\n");
         GlobalsDestroy();
