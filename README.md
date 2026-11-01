@@ -35,13 +35,15 @@ X-Response-Info: blocked
 
 ### Protocol Support
 
-Currently, `icapsuricata` assumes the protocol is `tcp` unless the `X-Proto` header contains `udp` (this requirement may change in the future as new protocol support are added). Depending on the protocol, SSLproxy sends `http`, `https`, `http2`, or `http3` in the `X-Proto` header.
+Currently, `icapsuricata` assumes the protocol is `tcp` unless the `X-Proto` header contains `udp` (this requirement may change in the future as new protocol support are added). Depending on the protocol, SSLproxy sends `tcp`, `http`, `https`, `http2`, `http3`, `pop3`, `pop3s`, `smtp`, `smtps`, `autossl`, `autossl-tls`, `ssl` in `X-Proto` header.
 
 * **HTTP/1:** `icapsuricata` and the ICAP subsystem in `SSLproxy` support HTTP/1. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H1 connection, and passes H1 headers directly to it.
 
 * **HTTP/2:** `icapsuricata` does not support HTTP/2, nor does it need to. `SSLproxy` supports HTTP/2. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H2 stream, and translates H2 headers into H1 equivalents. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H2. So, `icapsuricata` never receives any H2 header.
 
 * **HTTP/3 and QUIC:** `icapsuricata` does not support HTTP/3 or QUIC, nor does it need to. `SSLproxy` supports HTTP/3 and QUIC. So, `SSLproxy` opens one ICAP connection to `icapsuricata` per H3 stream, and translates H3 headers into H1 equivalents. When `SSLproxy` receives the ICAP response from `icapsuricata`, it translates H1 headers back into H3. So, `icapsuricata` never receives any H3 header.
+
+* **POP3 and SMTP:** `icapsuricata` does not support POP3 or SMTP, nor does it need to. `SSLproxy` supports POP3 and SMTP. So, `SSLproxy` opens one ICAP connection to send an ICAP request to `icapsuricata` for each POP3/SMTP content. Since ICAP requests for POP3 and SMTP do not contain any HTTP headers, their content is injected into Suricata as plain tcp. Since `icapsuricata` cannot determine the connection end on its own, when `SSLproxy` detects a `QUIT` command from client, it sends an `X-Conn-State: finished` header to `icapsuricata`. When `icapsuricata` receives this header, it injects the final FIN packets to Suricata for flow termination.
 
 `icapsuricata` always uses the client port of the ICAP connection for that connection/stream as the client port in the emulated TCP packets injected into `Suricata`. This allows `Suricata` to distinguish different H2 and H3 streams, otherwise they all would have the same client port, which would confuse the flow tracking in `Suricata`. But, it also adds the actual client port in the `X-Client-Port` header to the emulated packet as the common TCP option kind `78`, so that standard packet dissecting layers can recognize and pull the actual client port in that TCP option.
 
