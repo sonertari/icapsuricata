@@ -1489,36 +1489,31 @@ out:
     ctx->server_ack = 0;
 }
 
-static int suri_set_seq_numbers(ci_request_t *req)
+static void suri_get_conn_state(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
 
-    if (req->type == ICAP_REQMOD) {
-        suri_init_tcp_session(ctx);
+    struct suri_conn_key key = GetConnKey(req);
+    if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port, IsHTTP(req)) == 1) {
+        ctx->icap_client_port_set = 1;
+
+        // If we can find the connection state in the conn table, we assume the connection has been established before
+        ctx->state = ESTABLISHED;
     }
     else {
-        struct suri_conn_key key = GetConnKey(req);
-        if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port, IsHTTP(req)) == 1) {
-            ctx->icap_client_port_set = 1;
-
-            // For response, we assume the connection is already established
-            ctx->state = ESTABLISHED;
-        }
-        else {
-            suri_log(7, "No conn seq nums, use random seq nums, and emulate new flow\n");
-            // Suricata does NOT detect with these fallback values, it requires the actual seq nums from reqmod,
-            // but we will continue with these defaults if conn seq nums are not provided,
-            // and emulate/inject a new TCP handshake and a dummy GET request packets into Suricata
-            // to create a new flow in Suricata's flow table.
-            suri_init_tcp_session(ctx);
-        }
-
-        ctx->client_ack = ctx->server_seq;
-        ctx->server_ack = ctx->client_seq;
+        suri_log(7, "No connection state in conn table, use random seq nums\n");
+        // ATTENTION: Seq numbers are always saved in conn table in both reqmod and respmod.
+        // Suricata does NOT detect with these fallback values in respmod, it requires the actual seq nums.
+        // But we will continue with these defaults if we cannot find the actual seq nums in conn table in respmod,
+        // and emulate/inject a new TCP handshake and a dummy GET request packets into Suricata
+        // to create a new flow in Suricata's flow table in respmod.
+        suri_init_tcp_session(ctx);
     }
 
-    suri_log(7, "Set client_seq=%u, server_seq=%u, icap_client_port=%u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
-    return 0;
+    ctx->client_ack = ctx->server_seq;
+    ctx->server_ack = ctx->client_seq;
+
+    suri_log(7, "Get client_seq=%u, server_seq=%u, icap_client_port=%u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
 }
 
 static int suri_handle_inspect_result(ci_request_t *req, int rv)
@@ -1567,11 +1562,6 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         }
         else {
             suri_log(5, "X-Response-Info already set to continue\n");
-        }
-
-        // Seq numbers are passed from reqmod to respmod, do not save them in respmod
-        if (req->type == ICAP_RESPMOD) {
-            break;
         }
 
         suri_log(7, "Save conn state, seq nums: %u, %u, icap_client_port: %u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
@@ -1641,10 +1631,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
 
     suri_log(7, "Injecting %d bytes into Suricata\n", preview_data_len);
 
-    if (suri_set_seq_numbers(req) == -1) {
-        rv = -1;
-        goto out;
-    }
+    suri_get_conn_state(req);
 
     int emulate_get_request = 0;
 
