@@ -730,6 +730,29 @@ static int IsHTTP(ci_request_t *req)
     return is_http;
 }
 
+static int IsPOP3(ci_request_t *req)
+{
+    uint8_t proto_key = GetProtoKey(req);
+    int is_pop3 = (proto_key == 5 || proto_key == 6);
+
+    suri_log(9, "IsPOP3=%s, proto_key=%u\n", is_pop3 ? "yes" : "no", proto_key);
+    return is_pop3;
+}
+
+static int IsSMTP(ci_request_t *req)
+{
+    uint8_t proto_key = GetProtoKey(req);
+    int is_smtp = (proto_key == 7 || proto_key == 8);
+
+    suri_log(9, "IsSMTP=%s, proto_key=%u\n", is_smtp ? "yes" : "no", proto_key);
+    return is_smtp;
+}
+
+static int IsCommandResponseProto(ci_request_t *req)
+{
+    return IsPOP3(req) || IsSMTP(req);
+}
+
 static uint8_t GetConnStateFinished(ci_request_t *req)
 {
     struct suri_ctx *ctx = ci_service_data(req);
@@ -1494,7 +1517,7 @@ static void suri_get_conn_state(ci_request_t *req)
     struct suri_ctx *ctx = ci_service_data(req);
 
     struct suri_conn_key key = GetConnKey(req);
-    if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port, IsHTTP(req)) == 1) {
+    if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port, !IsCommandResponseProto(req)) == 1) {
         ctx->icap_client_port_set = 1;
 
         // If we can find the connection state in the conn table, we assume the connection has been established before
@@ -1562,6 +1585,11 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
         }
         else {
             suri_log(5, "X-Response-Info already set to continue\n");
+        }
+
+        // In non-command/response protocols like HTTP, seq numbers are passed from reqmod to respmod only, so do not save them in respmod
+        if (req->type == ICAP_RESPMOD && !IsCommandResponseProto(req)) {
+            break;
         }
 
         suri_log(7, "Save conn state, seq nums: %u, %u, icap_client_port: %u\n", ctx->client_seq, ctx->server_seq, ntohs(GetIcapClientPort(req)));
@@ -1776,8 +1804,9 @@ int suri_end_of_data_handler(ci_request_t *req)
     }
 
     // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
-    // Only inject FIN packets if the connection is HTTP or if the connection state is finished with the other protocols
-    if ((req->type != ICAP_REQMOD || ctx->error) && (IsHTTP(req) || GetConnStateFinished(req)) && !ctx->block && ctx->state != FIN) {
+    // Only inject FIN packets if the connection is not a command/response protocol like POP3/SMTP,
+    // or if the connection state is finished with a command/response protocol
+    if ((req->type != ICAP_REQMOD || ctx->error) && (!IsCommandResponseProto(req) || GetConnStateFinished(req)) && !ctx->block && ctx->state != FIN) {
         ctx->state = FIN;
 
         suri_log(7, "Inject FIN|ACK packet to server\n");
