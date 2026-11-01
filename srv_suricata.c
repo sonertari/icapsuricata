@@ -161,6 +161,8 @@ struct suri_ctx {
     unsigned int proto_set : 1;
     uint8_t  proto_key;
     unsigned int proto_key_set : 1;
+    uint8_t  conn_state_finished;
+    unsigned int conn_state_finished_set : 1;
 
     uint32_t client_seq;
     uint32_t client_ack;
@@ -726,6 +728,26 @@ static int IsHTTP(ci_request_t *req)
 
     suri_log(9, "IsHTTP=%s, proto_key=%u\n", is_http ? "yes" : "no", proto_key);
     return is_http;
+}
+
+static uint8_t GetConnStateFinished(ci_request_t *req)
+{
+    struct suri_ctx *ctx = ci_service_data(req);
+
+    if (ctx->conn_state_finished_set) {
+        return ctx->conn_state_finished;
+    }
+
+    ctx->conn_state_finished = 0;  /* Default to not finished */
+
+    const char *conn_state_finished_str = ci_icap_request_get_header(req, "X-Conn-State");
+    if (conn_state_finished_str && strcasecmp(conn_state_finished_str, "finished") == 0) {
+        ctx->conn_state_finished = 1;
+        ctx->conn_state_finished_set = 1;
+    }
+
+    suri_log(9, "X-Conn-State=%s\n", conn_state_finished_str ? conn_state_finished_str : "not set, using default 0");
+    return ctx->conn_state_finished;
 }
 
 static struct suri_conn_key GetConnKey(ci_request_t *req)
@@ -1767,7 +1789,8 @@ int suri_end_of_data_handler(ci_request_t *req)
     }
 
     // Do not inject FIN packets if already blocked, as Suricata returns "flow drop" once it has marked a flow as dropped
-    if ((req->type != ICAP_REQMOD || ctx->error) && !ctx->block && ctx->state != FIN) {
+    // Only inject FIN packets if the connection is HTTP or if the connection state is finished with the other protocols
+    if ((req->type != ICAP_REQMOD || ctx->error) && (IsHTTP(req) || GetConnStateFinished(req)) && !ctx->block && ctx->state != FIN) {
         ctx->state = FIN;
 
         suri_log(7, "Inject FIN|ACK packet to server\n");
