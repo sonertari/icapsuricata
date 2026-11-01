@@ -693,9 +693,39 @@ static uint8_t GetProtoKey(ci_request_t *req)
     else if (equal(proto_str, "http")) {
         ctx->proto_key = 4;
     }
+    else if (equal(proto_str, "pop3")) {
+        ctx->proto_key = 5;
+    }
+    else if (equal(proto_str, "pop3s")) {
+        ctx->proto_key = 6;
+    }
+    else if (equal(proto_str, "smtp")) {
+        ctx->proto_key = 7;
+    }
+    else if (equal(proto_str, "smtps")) {
+        ctx->proto_key = 8;
+    }
+    else if (equal(proto_str, "autossl")) {
+        ctx->proto_key = 9;
+    }
+    else if (equal(proto_str, "autossl-tls")) {
+        ctx->proto_key = 10;
+    }
+    else if (equal(proto_str, "ssl")) {
+        ctx->proto_key = 11;
+    }
 
-    suri_log(9, "X-Proto=%s, proto_key=%u\n", proto_str ? proto_str : "not set, using default TCP", ctx->proto_key  );
+    suri_log(9, "X-Proto=%s, proto_key=%u\n", proto_str ? proto_str : "not set, using default TCP", ctx->proto_key);
     return ctx->proto_key;
+}
+
+static int IsHTTP(ci_request_t *req)
+{
+    uint8_t proto_key = GetProtoKey(req);
+    int is_http = (proto_key == 1 || proto_key == 2 || proto_key == 3 || proto_key == 4);
+
+    suri_log(9, "IsHTTP=%s, proto_key=%u\n", is_http ? "yes" : "no", proto_key);
+    return is_http;
 }
 
 static struct suri_conn_key GetConnKey(ci_request_t *req)
@@ -1446,7 +1476,7 @@ static int suri_set_seq_numbers(ci_request_t *req)
     }
     else {
         struct suri_conn_key key = GetConnKey(req);
-        if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port) == 1) {
+        if (suri_conn_table_get(&key, &ctx->client_seq, &ctx->server_seq, &ctx->icap_client_port, IsHTTP(req)) == 1) {
             ctx->icap_client_port_set = 1;
 
             // For response, we assume the connection is already established
@@ -1597,7 +1627,7 @@ int suri_check_preview_handler(char *preview_data, int preview_data_len, ci_requ
     int emulate_get_request = 0;
 
     if (ctx->state == SYN) {
-        if (req->type == ICAP_RESPMOD) {
+        if (req->type == ICAP_RESPMOD && IsHTTP(req)) {
             emulate_get_request = 1;
         }
 

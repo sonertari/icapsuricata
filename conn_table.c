@@ -312,7 +312,7 @@ int suri_conn_table_set(const struct suri_conn_key *key, uint32_t client_seq, ui
     return 0;
 }
 
-int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, uint32_t *server_seq, uint16_t *icap_client_port)
+int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, uint32_t *server_seq, uint16_t *icap_client_port, int delete)
 {
     if (!g_shm_conn_table) return 0;
 
@@ -334,8 +334,8 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
 
         /* 1. KEY MATCH (Even if expired - fetch and evict) */
         if (suri_conn_key_equal(&curr->key, key)) {
-            suri_log(7, "Get and delete connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
-                idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
+            suri_log(7, "Get%s connection for key hash index: %u, client seq: %u, server seq: %u, icap client port: %u\n",
+                delete ? " and delete" : "", idx, curr->val.client_seq, curr->val.server_seq, ntohs(curr->val.icap_client_port));
 
             if (client_seq)       *client_seq = curr->val.client_seq;
             if (server_seq)       *server_seq = curr->val.server_seq;
@@ -347,7 +347,9 @@ int suri_conn_table_get(const struct suri_conn_key *key, uint32_t *client_seq, u
                 b->head_idx = next_idx;
             }
 
-            suri_shm_node_free(curr_idx);
+            if (delete) {
+                suri_shm_node_free(curr_idx);
+            }
             found = 1;
             break;
         }
