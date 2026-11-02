@@ -1587,8 +1587,9 @@ static int suri_handle_inspect_result(ci_request_t *req, int rv)
             suri_log(5, "X-Response-Info already set to continue\n");
         }
 
-        // In non-command/response protocols like HTTP, seq numbers are passed from reqmod to respmod only, so do not save them in respmod
-        if (req->type == ICAP_RESPMOD && !IsCommandResponseProto(req)) {
+        // In non-command/response protocols like HTTP, seq numbers are passed from reqmod to respmod only, so do not save them in respmod.
+        // And if the conn state is FIN, we have already deleted the connection from the table, so do not recreate it.
+        if ((req->type == ICAP_RESPMOD && !IsCommandResponseProto(req)) || ctx->state == FIN) {
             break;
         }
 
@@ -1808,6 +1809,11 @@ int suri_end_of_data_handler(ci_request_t *req)
     // or if the connection state is finished with a command/response protocol
     if ((req->type != ICAP_REQMOD || ctx->error) && (!IsCommandResponseProto(req) || GetConnStateFinished(req)) && !ctx->block && ctx->state != FIN) {
         ctx->state = FIN;
+
+        // We terminate the flow by injecting a FIN packet, so its conn state in the connection table becomes stale.
+        // We delete entries for non-command/response protocols, such as HTTP, from the conn table, when we get conn state on RESPMOD,
+        // but we try to delete them here when injecting a FIN packet too.
+        suri_conn_table_delete(&ctx->key);
 
         suri_log(7, "Inject FIN|ACK packet to server\n");
         if ((rv = InjectPacket(req, NULL, 0, TH_FIN|TH_ACK, 1)) != 0) {

@@ -38,5 +38,6 @@ void suri_conn_table_destroy(void);
 
 int suri_conn_table_set(const struct suri_conn_key *, uint32_t, uint32_t, uint16_t);
 int suri_conn_table_get(const struct suri_conn_key *, uint32_t *, uint32_t *, uint16_t *, int);
+void suri_conn_table_delete(const struct suri_conn_key *);
 
 #endif /* CONN_TABLE_H */
