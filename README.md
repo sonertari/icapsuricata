@@ -200,7 +200,7 @@ For example, you can use the following ICAP specification in SSLproxy:
 ```text
 Icap icap://127.0.0.1:1344,suricata,suricata,yes,yes,10,1024,0,16384,yes,no
 ```
-See the [icap branch](https://github.com/sonertari/SSLproxy/tree/icap) in the SSLproxy project for details.
+See the [SSLproxy](https://github.com/sonertari/SSLproxy) project for further details.
 
 ## Licensing
 
